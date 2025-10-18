@@ -181,7 +181,7 @@ fd00:abcd:ef01:2::33/64
 
 ```bash
 hr start     # Запуск HydraRoute
-hr stop      # Остановка и очистка iptables/ipset
+hr stop      # Остановка и очистка iptables
 hr restart   # Перезапуск с восстановлением AGH и политик
 hr status    # Проверка состояния службы
 ```
@@ -209,7 +209,7 @@ curl -Ls "https://ground-zerro.github.io/release/keenetic/hr-uninstall.sh" | sh
 
 ## ℹ️ Примечания и лицензия
 
-HydraRoute распространяется бесплатно, «как есть». Автор не несёт ответственности за последствия использования.
+HydraRoute распространяется бесплатно, «как есть». Автор не несёт ответственности за последствия использования.  
 Classic-ветка заморожена, поддержка ведётся только в рамках BugFix.
 
 **GitHub:** [https://github.com/Ground-Zerro/HydraRoute](https://github.com/Ground-Zerro/HydraRoute)
