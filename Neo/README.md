@@ -249,4 +249,4 @@ curl -Ls "https://ground-zerro.github.io/release/keenetic/hr-uninstall.sh" | sh
 
 HydraRoute Neo распространяется бесплатно, «как есть». Автор не несёт ответственности за последствия использования.
 
-**Скачать "Спасибо" можно на** [Boosty](https://boosty.to/ground_zerro) ❤️
+**Сказать "Спасибо" можно на** [Boosty](https://boosty.to/ground_zerro) ❤️
