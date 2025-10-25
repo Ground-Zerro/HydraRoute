@@ -241,5 +241,4 @@ curl -Ls "https://ground-zerro.github.io/release/keenetic/hr-uninstall.sh" | sh
 HydraRoute распространяется бесплатно, «как есть». Автор не несёт ответственности за последствия использования.  
 Classic-ветка заморожена, поддержка ведётся только в рамках BugFix.
 
-**Поддержка проекта:** [Boosty](https://boosty.to/ground_zerro)
-
+**Сказать "Спасибо" можно на** [Boosty](https://boosty.to/ground_zerro) ❤️
