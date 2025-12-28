@@ -322,6 +322,7 @@ opkg remove hrneo
 ```bash
 curl -Ls "https://ground-zerro.github.io/release/keenetic/hr-uninstall.sh" | sh
 ```
+> ⚠️ Будут полностью удалены следующие пакеты: hrneo, hrweb, ipset, iptables, jq, hydraroute, adguardhome-go, node, node-npm
 
 ---
 
