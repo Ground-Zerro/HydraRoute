@@ -49,7 +49,7 @@
 
 Выполните команду в терминале роутера:
 ```bash
-opkg update && opkg install curl && curl -Ls "https://ground-zerro.github.io/release/keenetic/install-neo.sh" | sh
+opkg update && opkg install curl && curl -Ls "https://git.zerrolabs.org/Ground-Zerro/release/pages/keenetic/install-neo.sh" | sh
 ```
 
 > Веб-интерфейс (HRweb) также будет устанволен и доступен по ссылке `http://<IP роутера>:2000`  
@@ -60,7 +60,7 @@ opkg update && opkg install curl && curl -Ls "https://ground-zerro.github.io/rel
 
 1. Добавьте репозиторий:
 ```bash
-curl -Ls "https://ground-zerro.github.io/release/keenetic/install-feed.sh" | sh
+curl -Ls "https://git.zerrolabs.org/Ground-Zerro/release/pages/keenetic/install-feed.sh" | sh
 ```
 2. Установите Neo:
 ```bash
@@ -364,7 +364,7 @@ neo status    # Проверка состояния службы
 
 Полное: включая логи, конфиги, зависимые пакеты, откат всех изменений системы (рекомендуется):
 ```bash
-curl -Ls "https://ground-zerro.github.io/release/keenetic/hr-uninstall.sh" | sh
+curl -Ls "https://git.zerrolabs.org/Ground-Zerro/release/pages/keenetic/hr-uninstall.sh" | sh
 ```
 
 > Будут удалены:  

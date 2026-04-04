@@ -19,26 +19,26 @@ DNS-based policy routing демон для Keenetic. Перехватывает 
 - Веб-интерфейс управления (HRweb)
 - Полная поддержка IPv6
 
-[Подробная документация →](https://github.com/Ground-Zerro/HydraRoute/tree/main/Neo)
+[Подробная документация →](https://git.zerrolabs.org/Ground-Zerro/HydraRoute/tree/main/Neo)
 
 ### Classic — EOL
 
 Жизненный цикл завершён. Поддержка прекращена.
 
-[Архив →](https://github.com/Ground-Zerro/HydraRoute/tree/main/Classic)
+[Архив →](https://git.zerrolabs.org/Ground-Zerro/HydraRoute/tree/main/Classic)
 
 ### Relic — EOL
 
 Жизненный цикл завершён. Поддержка прекращена.
 
-[Архив →](https://github.com/Ground-Zerro/HydraRoute/tree/main/Relic)
+[Архив →](https://git.zerrolabs.org/Ground-Zerro/HydraRoute/tree/main/Relic)
 
 ---
 
 ## Быстрый старт (Neo)
 
 ```bash
-opkg update && opkg install curl && curl -Ls "https://ground-zerro.github.io/release/keenetic/install-neo.sh" | sh
+opkg update && opkg install curl && curl -Ls "https://git.zerrolabs.org/Ground-Zerro/release/pages/keenetic/install-neo.sh" | sh
 ```
 
 **Требования:** роутер Keenetic с прошивкой выше v4.3.6, установленный Entware, компонент «Xtables-addons для Netfilter».
