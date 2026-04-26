@@ -1,6 +1,6 @@
 # HydraRoute Neo
 
-**HydraRoute Neo** — демон для раздельной маршрутизации трафика по доменам и CIDR на роутерах **Keenetic**. Перехватывает DNS-ответы через NFLOG, добавляет IP-адреса в ipset и маркирует трафик в iptables для перенаправления через нужный туннель или интерфейс. Написан на Go, без CGO, единый бинарник.
+**HydraRoute Neo** — демон для раздельной маршрутизации трафика по доменам и CIDR на роутерах **Keenetic**. Перехватывает DNS-ответы через NFLOG, добавляет IP-адреса в ipset и маркирует трафик в iptables для перенаправления через нужный туннель или интерфейс. Написан на C, единый статически скомпилированный бинарник.
 
 ---
 
@@ -41,7 +41,7 @@
 
 - Роутер Keenetic с прошивкой выше v4.3.6
 - Установленная [Entware](https://help.keenetic.com/hc/ru/articles/360021214160)
-- Добавлен систменый компонент Keenetic `Xtables-addons для Netfilter`
+- Добавлен системный компонент Keenetic `Xtables-addons для Netfilter`
 
 ---
 
@@ -52,7 +52,7 @@
 opkg update && opkg install curl && curl -Ls "https://git.zerrolabs.org/Ground-Zerro/release/pages/keenetic/install-neo.sh" | sh
 ```
 
-> Веб-интерфейс (HRweb) также будет устанволен и доступен по ссылке `http://<IP роутера>:2000`  
+> Веб-интерфейс (HRweb) также будет установлен и доступен по ссылке `http://<IP роутера>:2000`  
 > Службы запустятся автоматически
 
 <details>
@@ -136,7 +136,7 @@ opkg update && opkg upgrade
 | `InterfaceFwMarkStart` | `12289` | Начальный fwmark (0x3001) для интерфейсов |
 | `InterfaceTableStart` | `301` | Начальный номер таблицы маршрутизации |
 
-> Если в `domain.conf` цель совпадает с именем системного интерфейса — настраивается `ip rule + ip route`, иначе — политика Keenetic.
+> Если в `domain.conf` цель совпадает с именем системного интерфейса — настраивается `ip rule + ip route`, иначе — политика Keenetic.  
 > Если интерфейс DOWN при старте — создаётся blackhole-маршрут, который обновляется по SIGUSR1.
 
 **Conntrack:**
@@ -165,7 +165,7 @@ opkg update && opkg upgrade
 GeoIPFile=/opt/etc/HydraRoute/geofile/geoip.dat
 GeoIPFile=/opt/etc/HydraRoute/geofile/geoip_RU.dat
 ```
-Путь к базе GeoIP в формате v2ray/xray `.dat`. Параметр повторяем. Используется совместно с директивой `geoip:CC` в `ip.list`.
+Путь к базе GeoIP в формате v2ray/xray `.dat`. Параметр повторяем. Используется совместно с директивой `geoip:TAG` в `ip.list`.
 
 **GeoSite:**
 
@@ -202,7 +202,7 @@ PolicyOrder=HydraRoute
 
 Формат строки:
 ```
-домен1,домен2,geosite:TAG/ПолитикаИлиИнтерфейс
+домен1,домен2,geosite:tag/ПолитикаИлиИнтерфейс
 ```
 
 - Домен — точное совпадение и все поддомены
@@ -219,20 +219,20 @@ youtube.com,googlevideo.com/HydraRoute
 openai.com,chatgpt.com/nwg0
 
 ## GeoSite категория
-geosite:GOOGLE/HydraRoute
+geosite:google/HydraRoute
 
 ## GeoSite + обычные домены в одной строке
-geosite:GOOGLE,youtube.com,youtu.be/HydraRoute
+geosite:google,youtube.com,youtu.be/HydraRoute
 
 ## Несколько GeoSite категорий
-geosite:GOOGLE,geosite:NETFLIX/HydraRoute
+geosite:google,geosite:netflix/HydraRoute
 ```
 
 > GeoSite-домены поддерживают типы Domain (домен + поддомены) и Full (только точное имя)  
 > Типы Plain (keyword) и Regex не поддерживаются  
 > Записи из `domain.conf` имеют приоритет над GeoSite
 
-Популярные теги GeoSite: `GOOGLE`, `NETFLIX`, `TELEGRAM`, `RU`, `CN`.
+Популярные теги GeoSite: `google`, `netflix`, `telegram`, `ru`, `cn`.
 
 ---
 
@@ -252,13 +252,13 @@ geosite:GOOGLE,geosite:NETFLIX/HydraRoute
 
 ##GeoIP директива
 /HydraRoute
-geoip:RU
+geoip:ru
 ```
 
 - `/ПолитикаИлиИнтерфейс` — активный блок
 - `#/ПолитикаИлиИнтерфейс` — отключённый блок (содержимое игнорируется)
 - `##` — комментарий
-- `geoip:CC` — загрузить CIDR для страны из GeoIP-файлов (например `geoip:RU`, `geoip:CN`)
+- `geoip:ru` — загрузить CIDR для страны из GeoIP-файлов (например `geoip:ru`, `geoip:us`)
 - Пустая строка завершает текущий блок
 - `/32` и `/128` добавляются как хосты, остальное — как подсети
 - CIDR-записи добавляются как постоянные (без таймаута), даже при включённом `IpsetEnableTimeout`
@@ -309,27 +309,40 @@ opkg install hrweb
 - Добавление и редактирование доменов и CIDR для каждой политики
 - Загрузка доменных списков из GitHub репозиториев и по прямым ссылкам
 - Интеграция с [iplist.opencck.org](https://iplist.opencck.org/)
+- Агрегация доменов из GeoSite-баз: просмотр тегов и добавление в политики
 - Валидация доменов и CIDR, обнаружение конфликтов между политиками
 
 **Proxy (xRay) — управление прокси:**
 - Установка xRay
 - Запуск и остановка службы xRay
-- Создание прокси-интерфейсов через Builder из share-ссылок (`vless://`, `vmess://`, `trojan://`, `ss://`) и URL подписок
-- Редактирование JSON конфигурации с подсветкой синтаксиса (CodeMirror)
+- Создание прокси-интерфейсов через Builder из share-ссылок (`vless://`, `vmess://`, `trojan://`, `ss://`, `socks://`, `http://`) и URL подписок
+- Редактирование JSON-конфигурации с подсветкой синтаксиса
 - Удаление пользовательских интерфейсов
 - Отображение статуса всех xRay-интерфейсов
+- Автоматическое создание балансировщика нагрузки при добавлении нескольких серверов
 
-**DANGER ZONE (HrNeo) — настройка демона:**
+**HrNeo — настройка демона:**
 - Управление службой HrNeo (запуск/остановка)
 - Редактирование всех параметров `hrneo.conf` через UI
 - Управление GeoIP/GeoSite файлами: скачивание, автоматическое обновление по расписанию
 - Настройка логирования
 
+**Диагностика маршрутизации:**
+- Пошаговая проверка прохождения трафика для конкретного домена
+- Определяет: политику и интерфейс для домена, состояние VPN-соединения, записи в ipset и правила iptables, маршрутизацию устройств в сети Keenetic
+
+**Настройки:**
+- Экспорт и импорт конфигурации (domains + CIDR) в формате CSV
+- Мониторинг загрузки CPU и RAM роутера в реальном времени
+- Настройка источника баз GeoIP/GeoSite
+
 **Автообновление GeoIP/GeoSite:**
-В разделе настроек HRweb можно настроить автоматическое скачивание и обновление баз GeoIP и GeoSite по расписанию. После загрузки hrneo перезапускается автоматически.
-Поддерживаемые базы:
-- `geoip.dat` / `geosite.dat` — [Loyalsoldier/v2ray-rules-dat](https://github.com/Loyalsoldier/v2ray-rules-dat)
-- `geoip_RU.dat` / `geosite_RU.dat` — [runetfreedom/russia-v2ray-rules-dat](https://github.com/runetfreedom/russia-v2ray-rules-dat)
+
+В разделе настроек HRweb можно настроить автоматическое скачивание и обновление баз по расписанию. После загрузки hrneo перезапускается автоматически.
+
+Поддерживаемые источники:
+- **GitHub** (`github`): [Loyalsoldier/v2ray-rules-dat](https://github.com/Loyalsoldier/v2ray-rules-dat) — `geoip.dat` / `geosite.dat`
+- **ZerroLabs** (`zerrolabs`): [runetfreedom/russia-v2ray-rules-dat](https://github.com/runetfreedom/russia-v2ray-rules-dat) — `geoip_RU.dat` / `geosite_RU.dat`
 
 </details>
 
