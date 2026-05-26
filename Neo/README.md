@@ -1,6 +1,7 @@
 # HydraRoute Neo
 
-**HydraRoute Neo** — демон для раздельной маршрутизации трафика по доменам и CIDR на роутерах **Keenetic**. Перехватывает DNS-ответы через NFLOG, добавляет IP-адреса в ipset и маркирует трафик в iptables для перенаправления через нужный туннель или интерфейс. Написан на C, единый статически скомпилированный бинарник.
+**HydraRoute Neo** — демон для раздельной маршрутизации трафика по доменам и CIDR на роутерах **Keenetic**.  
+Перехватывает DNS-ответы dnsmasq через AF_PACKET, добавляет полученные IP в ipset и маркирует трафик в iptables/mangle CONNMARK для перенаправления через нужный туннель или интерфейс. Дополнительно — параллельный L7-канал: TLS SNI и HTTP Host из исходящих соединений через NFQUEUE (закрывает слепые зоны DoH/DoT, hardcoded-IP, легаси-HTTP). Написан на C, единый статически скомпилированный бинарь без внешних зависимостей кроме libc и Linux API.
 
 ---
 
@@ -13,10 +14,10 @@
 - [Параметры hrneo.conf](#параметры-hrneoconf)
 - [Работа с доменами (domain.conf)](#работа-с-доменами-domainconf)
 - [Работа с CIDR (ip.list)](#работа-с-cidr-iplist)
+- [L7-перехват (TLS SNI / HTTP Host)](#l7-перехват-tls-sni--http-host)
 - [Политики доступа](#политики-доступа)
 - [Веб-интерфейс (HRweb)](#веб-интерфейс-hrweb)
 - [Управление](#управление)
-- [IPv6](#ipv6)
 - [Удаление](#удаление)
 - [Лицензия](#лицензия)
 
@@ -31,9 +32,10 @@
 - Прямая маршрутизация трафика на сетевые интерфейсы (DirectRoute)
 - Поддержка статических CIDR-диапазонов с IPv4 и IPv6
 - Работа с базами GeoIP и GeoSite в формате v2ray/xray `.dat`
-- Корректная маршрутизация без переподключения
-- Полная поддержка IPv6
-- Управление через веб-интерфейс HRweb
+- Перехват DNS-ответов LAN- и VPN-клиентов роутера (Ethernet, PPP, WireGuard, VPN-сервер, IPsec, туннели)
+- Параллельный L7-канал (опц.): TLS SNI и HTTP Host через NFQUEUE с TCP-реассамблецией длинных ClientHello (Kyber/MLKEM)
+- Корректная маршрутизация без переподключения (опц. ConntrackFlush)
+- Управление через веб-интерфейс
 
 ---
 
@@ -90,111 +92,21 @@ opkg update && opkg upgrade
 
 ## Параметры hrneo.conf
 
-<details>
-<summary>Все параметры с описанием</summary>
+Всего **27 параметров** конфигурации, сгруппированных по назначению:
 
-**Основные:**
+- **Основные:** `autoStart`, `watchlistPath`, `clearIPSet`
+- **CIDR:** `CIDR`, `CIDRfile`
+- **IPSet:** `IpsetEnableTimeout`, `IpsetTimeout`, `IpsetMaxElem`
+- **Логирование:** `log`, `logfile`
+- **DirectRoute:** `DirectRouteEnabled`, `InterfaceFwMarkStart`, `InterfaceTableStart`
+- **Conntrack:** `ConntrackFlush`
+- **Маршрутизация:** `GlobalRouting`, `PolicyOrder`
+- **GeoIP / GeoSite:** `GeoIPFile`, `GeoSiteFile` (оба повторяемые)
+- **L7-перехват:** `l7CaptureEnabled`, `l7QueueNum`, `l7EnableTLS`, `l7EnableHTTP`, `l7WanInterface`, `l7ConnbytesMax`, `l7TcpReasmEnabled`, `l7TcpReasmMaxEntries`, `l7TcpReasmTtlSec`
 
-| Параметр | По умолчанию | Описание |
-|----------|-------------|----------|
-| `autoStart` | `true` | `false` — немедленное завершение без изменения iptables/ipset |
-| `watchlistPath` | `/opt/etc/HydraRoute/domain.conf` | Путь к файлу доменов |
-| `clearIPSet` | `true` | Очищать ipset при запуске; `false` — сохранять накопленные IP |
+> Полное описание каждого параметра, дефолтов, поведения и взаимодействия с роутером (RCI, PolicyOrder, ConntrackFlush и т.д.) — см. **[docs/HRNEO.CONF.md](docs/HRNEO.CONF.md)**.
 
-**CIDR:**
-
-| Параметр | По умолчанию | Описание |
-|----------|-------------|----------|
-| `CIDR` | `true` | Включить загрузку статических IP/подсетей из `CIDRfile` |
-| `CIDRfile` | `/opt/etc/HydraRoute/ip.list` | Путь к файлу CIDR |
-
-**IPSet:**
-
-| Параметр | По умолчанию | Описание |
-|----------|-------------|----------|
-| `IpsetEnableTimeout` | `true` | Автоматическое удаление записей по таймауту |
-| `IpsetTimeout` | `21600` | Таймаут в секундах (21600 = 6 часов, 86400 = 24 часа) |
-
-> При повторном добавлении существующего IP таймаут не обновляется.
-
-**Логирование:**
-
-| Параметр | По умолчанию | Описание |
-|----------|-------------|----------|
-| `log` | `off` | Режим: `console` — stdout, `file` — файл, остальное — отключено |
-| `logfile` | `/opt/var/log/LOGhrneo.log` | Путь к файлу логов (только при `log=file`) |
-
-> Включать логирование без целей отладки не рекомендуется.
-
-Уровни лога: `[DEBUG]` `[INFO]` `[MATCH]` `[PROCESSED]` `[FILTERED]` `[WARN]` `[ERROR]`
-
-**DirectRoute (прямая маршрутизация на интерфейс):**
-
-| Параметр | По умолчанию | Описание |
-|----------|-------------|----------|
-| `DirectRouteEnabled` | `true` | Включить прямую маршрутизацию на сетевые интерфейсы |
-| `InterfaceFwMarkStart` | `12289` | Начальный fwmark (0x3001) для интерфейсов |
-| `InterfaceTableStart` | `301` | Начальный номер таблицы маршрутизации |
-
-> Если в `domain.conf` цель совпадает с именем системного интерфейса — настраивается `ip rule + ip route`, иначе — политика Keenetic.  
-> Если интерфейс DOWN при старте — создаётся blackhole-маршрут, который обновляется по SIGUSR1.
-
-**Conntrack:**
-
-| Параметр | По умолчанию | Описание |
-|----------|-------------|----------|
-| `ConntrackFlush` | `true` | Сбрасывать conntrack-записи при первом добавлении IP в ipset |
-
-> Обеспечивает корректную маршрутизацию без разрыва уже установленных соединений вручную.
-
-**Глобальная маршрутизация:**
-
-| Параметр | По умолчанию | Описание |
-|----------|-------------|----------|
-| `GlobalRouting` | `false` | `false` — уважать политики роутера (NoVPN, Policy0 и т.д.); `true` — перезаписывать все политики |
-
-**Порядок политик:**
-
-| Параметр | По умолчанию | Описание |
-|----------|-------------|----------|
-| `PolicyOrder` | `HydraRoute` | Порядок добавления правил iptables через запятую; определяет приоритет при совпадении IP в нескольких ipset |
-
-**GeoIP:**
-
-```
-GeoIPFile=/opt/etc/HydraRoute/geofile/geoip.dat
-GeoIPFile=/opt/etc/HydraRoute/geofile/geoip_RU.dat
-```
-Путь к базе GeoIP в формате v2ray/xray `.dat`. Параметр повторяем. Используется совместно с директивой `geoip:TAG` в `ip.list`.
-
-**GeoSite:**
-
-```
-GeoSiteFile=/opt/etc/HydraRoute/geofile/geosite.dat
-GeoSiteFile=/opt/etc/HydraRoute/geofile/geosite_RU.dat
-```
-Путь к базе GeoSite в формате v2ray/xray `.dat`. Параметр повторяем. Используется совместно с директивой `geosite:TAG` в `domain.conf`.
-
-**Пример конфигурации по умолчанию:**
-```
-autoStart=true
-watchlistPath=/opt/etc/HydraRoute/domain.conf
-clearIPSet=true
-IpsetEnableTimeout=true
-IpsetTimeout=21600
-CIDR=true
-CIDRfile=/opt/etc/HydraRoute/ip.list
-DirectRouteEnabled=true
-InterfaceFwMarkStart=12289
-InterfaceTableStart=301
-GlobalRouting=false
-ConntrackFlush=true
-log=off
-logfile=/opt/var/log/LOGhrneo.log
-PolicyOrder=HydraRoute
-```
-
-</details>
+Любой параметр доступен и как CLI-флаг (`--имя value`); приоритет: **CLI > конфиг-файл > встроенные дефолты**. Дефолтный `hrneo.conf` со всеми ключами генерируется командой `hrneo --genconfig /opt/etc/HydraRoute/`.
 
 ---
 
@@ -207,8 +119,9 @@ PolicyOrder=HydraRoute
 
 - Домен — точное совпадение и все поддомены
 - `geosite:TAG` — загрузить домены из GeoSite `.dat` файла для указанного тега
-- Имя после `/` — если совпадает с именем системного интерфейса: DirectRoute, иначе: политика Keenetic
+- Имя после `/` — если совпадает с именем системного интерфейса: `DirectRoute`, иначе: политика Keenetic
 - Строки, начинающиеся с `#` или `##` — комментарии
+- Длина строки не ограничена (читается через getline)
 
 Примеры:
 ```
@@ -231,8 +144,6 @@ geosite:google,geosite:netflix/HydraRoute
 > GeoSite-домены поддерживают типы Domain (домен + поддомены) и Full (только точное имя)  
 > Типы Plain (keyword) и Regex не поддерживаются  
 > Записи из `domain.conf` имеют приоритет над GeoSite
-
-Популярные теги GeoSite: `google`, `netflix`, `telegram`, `ru`, `cn`.
 
 ---
 
@@ -262,6 +173,7 @@ geoip:ru
 - Пустая строка завершает текущий блок
 - `/32` и `/128` добавляются как хосты, остальное — как подсети
 - CIDR-записи добавляются как постоянные (без таймаута), даже при включённом `IpsetEnableTimeout`
+- Длина строки не ограничена (читается через getline)
 
 Один блок для нескольких политик и отключение отдельных подблоков:
 ```
@@ -274,7 +186,26 @@ geoip:ru
 172.22.48.77/26
 ```
 
-> Избегайте перекрывающихся подсетей в разных политиках
+> Избегайте перекрывающихся подсетей в разных политиках  
+> Если `geoip:TAG` содержит записей больше `IpsetMaxElem`, тег автоматически переносится в раздел `#/Too-big-geoip-tag`
+
+---
+
+## L7-перехват (TLS SNI / HTTP Host)
+
+Параллельный DNS-каналу источник имён хостов. Активируется `l7CaptureEnabled=true` (по умолчанию). Закрывает слепые зоны DNS-only схемы:
+
+- клиенты с DoH/DoT/DoQ (DNS зашифрован — hrneo его не видит)
+- hardcoded-IP с TLS SNI (без DNS-резолва)
+- легаси-HTTP
+- тёплый DNS-кэш устройства (TTL ещё не истёк)
+
+**Известные ограничения:**
+- **QUIC / HTTP-3 (UDP/443)** — не реализовано; значимо для Apple-устройств (Safari/iCloud/Push активно используют h3)
+- **ECH (Encrypted ClientHello)** — нерешаемо без MITM
+- **iCloud Private Relay** — by design зашифрованный туннель
+
+Полный технический разбор — в [docs/HRNEO.CONF.md](docs/HRNEO.CONF.md) и [docs/CORE.md](docs/CORE.md).
 
 ---
 
@@ -304,49 +235,41 @@ opkg install hrweb
 <details>
 <summary>Возможности HRweb</summary>
 
-**Dashboard — управление маршрутизацией:**
-- Управление политиками маршрутизации (обычные через Keenetic и интерфейсные DirectRoute)
-- Добавление и редактирование доменов и CIDR для каждой политики
-- Загрузка доменных списков из GitHub репозиториев и по прямым ссылкам
-- Интеграция с [iplist.opencck.org](https://iplist.opencck.org/)
-- Агрегация доменов из GeoSite-баз: просмотр тегов и добавление в политики
+Интерфейс разделён на пять разделов (боковое меню) и общую панель с показателями CPU/RAM роутера, версиями hrneo/hrweb и моделью устройства.
+
+**Dashboard — маршрутизация:**
+- Управление политиками Keenetic и DirectRoute-интерфейсами (создание, удаление, редактирование)
+- Редактор доменов и CIDR для каждой цели
+- Импорт списков: из репозиториев [Geo-Aggregator](https://github.com/Ground-Zerro/Geo-Aggregator), по тегам GeoIP/GeoSite, с [iplist.opencck.org](https://iplist.opencck.org/), а также из произвольной ссылки
 - Валидация доменов и CIDR, обнаружение конфликтов между политиками
+- Экспорт и импорт всей конфигурации (политики + домены + CIDR) в CSV
 
-**Proxy (xRay) — управление прокси:**
-- Установка xRay
-- Запуск и остановка службы xRay
-- Создание прокси-интерфейсов через Builder из share-ссылок (`vless://`, `vmess://`, `trojan://`, `ss://`, `socks://`, `http://`) и URL подписок
-- Редактирование JSON-конфигурации с подсветкой синтаксиса
-- Удаление пользовательских интерфейсов
-- Отображение статуса всех xRay-интерфейсов
-- Автоматическое создание балансировщика нагрузки при добавлении нескольких серверов
+**Proxy:** три подраздела на вкладках:
+- **XRay** — установка/запуск/остановка службы; конструктор интерфейсов из share-ссылок (`vless://`, `vmess://`, `trojan://`, `ss://`, `socks://`, `http://`) и URL подписок; редактор JSON-конфигов с подсветкой; при нескольких серверах автоматически создаётся балансировщик
+- **Монитор** — фоновый мониторинг доступности через captive-check (HTTP 204) с настраиваемым интервалом, порогами отказа/восстановления, таймаутом и выбором интерфейсов; автоматический failover на резервный канал при недоступности основного
 
-**HrNeo — настройка демона:**
-- Управление службой HrNeo (запуск/остановка)
-- Редактирование всех параметров `hrneo.conf` через UI
-- Управление GeoIP/GeoSite файлами: скачивание, автоматическое обновление по расписанию
-- Настройка логирования
+**HrNeo — управление демоном:**
+- Запуск/остановка службы hrneo
+- Управление GeoIP/GeoSite файлами: загрузка, автообновление по расписанию (с выбором часового пояса), переключение источника (GitHub Loyalsoldier или ZerroLabs RU)
+- Раздел **«DANGER ZONE»** — редактирование всех 27 параметров `hrneo.conf` через формы с подсказками
+- **Диагностика** — пошаговая проверка маршрутизации для указанного домена (политика, интерфейс, состояние ipset, правила iptables, доступность VPN)
 
-**Диагностика маршрутизации:**
-- Пошаговая проверка прохождения трафика для конкретного домена
-- Определяет: политику и интерфейс для домена, состояние VPN-соединения, записи в ipset и правила iptables, маршрутизацию устройств в сети Keenetic
+**Info — справка:**
+- Список полезных утилит сообщества (Domain Inspector, GEODAT EXPLORER, b4, web4core, HydraRoute Manager, Keenetic SSH, Flashkeen и др.)
+- Раздел благодарностей донорам
+- Отказ от ответственности
 
-**Настройки:**
-- Экспорт и импорт конфигурации (domains + CIDR) в формате CSV
-- Мониторинг загрузки CPU и RAM роутера в реальном времени
-- Настройка источника баз GeoIP/GeoSite
-
-**Автообновление GeoIP/GeoSite:**
-
-В разделе настроек HRweb можно настроить автоматическое скачивание и обновление баз по расписанию. После загрузки hrneo перезапускается автоматически.
-
-Поддерживаемые источники:
-- **GitHub** (`github`): [Loyalsoldier/v2ray-rules-dat](https://github.com/Loyalsoldier/v2ray-rules-dat) — `geoip.dat` / `geosite.dat`
-- **ZerroLabs** (`zerrolabs`): [runetfreedom/russia-v2ray-rules-dat](https://github.com/runetfreedom/russia-v2ray-rules-dat) — `geoip_RU.dat` / `geosite_RU.dat`
+**Settings — глобальные настройки:**
+- Отключение проверок доменов/DNS, виджет производительности, отображение всех xRay-конфигов
+- Кастомные HTTP-заголовки (User-Agent и др.) для загрузки подписок и Geo-файлов
+- Выбор источника Geo-файлов ([GitHub](https://github.com/Ground-Zerro/Geo-Aggregator) / [ZerroLabs RU](https://git.zerrolabs.org/Ground-Zerro/Geo-Aggregator))
+- Узел проверки доступности (Google, Cloudflare, Apple и др., либо собственный URL)
 
 </details>
 
-Также доступно стороннее решение: [**web4static**](https://github.com/spatiumstas/web4static)
+Также доступны сторонние решения:
+- [**awg-manager**](https://github.com/hoaxisr/awg-manager)
+- [**web4static**](https://github.com/spatiumstas/web4static)
 
 ---
 
@@ -354,22 +277,20 @@ opkg install hrweb
 
 ```bash
 neo start     # Запуск HydraRoute Neo
-neo stop      # Остановка и очистка iptables/ip rule
+neo stop      # Остановка и очистка iptables/ip rule + NFQUEUE-правила L7
 neo restart   # Перезапуск с пересозданием политик
 neo status    # Проверка состояния службы
 ```
 
----
+CLI hrneo (все параметры конфига доступны как `--flag value`):
+```bash
+hrneo --version              # вывести версию
+hrneo --help                 # справка по флагам
+hrneo --genconfig [path]     # сгенерировать дефолтный hrneo.conf
+hrneo --config <path>        # указать альтернативный путь к hrneo.conf
+```
 
-## IPv6
-
-Для работы IPv6 через VPN необходимо одновременное выполнение условий:
-- IPv6 у основного провайдера
-- IPv6 у VPN-сервера
-- IPv6 у VPN-пира (WireGuard, OpenVPN и т.д.)
-- Настроенная IPv6-маршрутизация на VPS
-
-> Если IPv6 не используется — отключите его в настройках подключения провайдера и VPN
+Приоритет источников значений: **CLI флаги > конфиг-файл > встроенные дефолты**.
 
 ---
 
@@ -393,6 +314,8 @@ opkg remove hrneo
 
 ## Лицензия
 
-HydraRoute Neo распространяется бесплатно, «как есть». Автор не несёт ответственности за последствия использования.
+HydraRoute Neo распространяется на условиях **GNU Affero General Public License v3.0 (AGPL-3.0-only)** — см. [LICENSE](LICENSE).
+
+Программа предоставляется «как есть», без каких-либо гарантий. Автор не несёт ответственности за последствия использования.
 
 **Поддержать проект:** [Boosty](https://boosty.to/ground_zerro)
