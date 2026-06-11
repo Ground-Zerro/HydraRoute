@@ -2,7 +2,7 @@
 
 Справочник по параметрам конфигурационного файла `hrneo.conf`, CLI-флагам и формату вспомогательных файлов (`domain.conf`, `ip.list`).
 
-**Версия кода:** hrneo 3.11.0-1
+**Версия кода:** hrneo 3.12.0-1
 
 ---
 
@@ -45,7 +45,7 @@ hrneo [OPTIONS]
 
 Пустые multi-value ключи пишутся как `GeoIPFile=`, `GeoSiteFile=`, `PolicyOrder=`, `l7WanInterface=`.
 
-> Все параметры имеют встроенное значение по умолчанию (см. колонку «default» в `--help`). Отсутствие любого ключа в конфиге **ИЛИ** среди флагов → используется дефолт (включая строковые пути `watchlistPath` / `CIDRfile` / `logfile` / `log`). Невалидное или пустое значение ключа → `[WARN]` + дефолт. Падения при отсутствии ключей нет.
+> Все параметры имеют встроенное значение по умолчанию (см. колонку «default» в `--help`). Отсутствие любого ключа в конфиге **ИЛИ** среди флагов → используется дефолт (включая строковые пути `watchlistPath` / `CIDRfile` / `logfile` / `log`). Невалидное числовое значение ключа в конфиге (нечисловое, число с мусором, ≤0 для строго положительных) → `[WARN] Invalid <key> value` + дефолт; у булевых ключей любое значение, кроме `true`, трактуется как `false`. Невалидное значение **CLI-флага** — ошибка и выход с кодом 1. Падения при отсутствии ключей нет.
 
 ---
 
@@ -73,7 +73,7 @@ hrneo [OPTIONS]
 --GeoSiteFile <path>            # повторяется; при наличии заменяет все GeoSiteFile= из конфига
 --PolicyOrder <p1,p2,...>
 --l7CaptureEnabled <true|false>
---l7QueueNum <int>
+--l7NflogGroup <int>
 --l7EnableTLS <true|false>
 --l7EnableHTTP <true|false>
 --l7WanInterface <ifname>
@@ -104,7 +104,7 @@ hrneo [OPTIONS]
 - несколько geosite-тегов и обычные домены можно смешивать в одной строке в любом порядке
 - если цель (после `/`) совпадает с именем сетевого интерфейса — используется DirectRoute, иначе — политика Keenetic
 - строки, начинающиеся с `#` или `##`, являются комментариями
-- длина строки не ограничена: список из тысяч доменов через запятую одной строкой обрабатывается целиком (чтение через `getline`; прежнего лимита 4096 байт нет)
+- длина строки не ограничена: список из тысяч доменов через запятую одной строкой обрабатывается целиком (чтение через `getline`)
 - DNS-запросы перехватываются у клиентов на интерфейсах любого типа, включая VPN-клиентов роутера (WireGuard / VPN-сервер / IPsec / туннели), а не только LAN
 
 ### `clearIPSet=true`
@@ -134,7 +134,7 @@ hrneo [OPTIONS]
 - `##` — комментарий
 - директива `geoip:CC` внутри секции — загружает CIDR для страны из GeoIP-файлов
 - пустая строка завершает текущую секцию
-- длина строки не ограничена (чтение через `getline`; прежнего лимита 4096 байт нет)
+- длина строки не ограничена (чтение через `getline`)
 
 ### `GeoIPFile=`
 
@@ -204,7 +204,7 @@ GeoSiteFile=/opt/etc/x-ui/bin/geosite.dat
 - дефолт `262144` = встроенное ядерное значение; передаётся в `ipset CREATE` как атрибут `IPSET_ATTR_MAXELEM`
 - значение задаёт жёсткий лимит на каждое `ipset`-множество; IP сверх лимита не добавляются (kernel вернёт `IPSET_ERR_HASH_FULL` → `[WARN]`)
 - применяется при `CREATE`; изменение лимита требует `clearIPSet=true` и перезапуска
-- используется как ограничение при загрузке CIDR: если `geoip:TAG` содержит записей больше лимита, тег автоматически отключается (помечается как `#/Too-big-geoip-tag` в `ip.list`, атомарная перезапись через `.tmp + rename`) с `[WARN]`
+- управляет двумя механизмами защиты ipset от переполнения с общим подсчётом записей: **автомиграция** — `geoip:TAG` с числом записей больше `IpsetMaxElem − 5000` (запас `CIDR_MIGRATE_HEADROOM`) отключается переносом в `#/Too-big-geoip-tag` в `ip.list` (атомарная перезапись через `.tmp + rename`) с `[WARN]`; **лимит загрузки** — суммарное число записей в каждом `ipset` не превышает `IpsetMaxElem`, теги/записи сверх лимита пропускаются с `[WARN]`
 
 ---
 
@@ -212,14 +212,14 @@ GeoSiteFile=/opt/etc/x-ui/bin/geosite.dat
 
 ### `log=off`
 
-Режим логирования (дефолт `off` — отладочные уровни отключены).
+Режим логирования (дефолт `off` — отладочные уровни отключены, но `[WARN]`/`[ERROR]` идут в системный лог).
 
 | Значение | Поведение |
 |----------|-----------|
 | `console` | весь вывод в `stdout` процесса, включая `[DEBUG]`-сообщения |
 | `file` | запись в файл `logfile`, включая `[DEBUG]`-сообщения |
 | `syslog` | отправка через `openlog`/`vsyslog` в `LOG_DAEMON` с тегом `"hrneo"`; `logfile` игнорируется |
-| `off` или иное | отладочные уровни отключены; `[WARN]`/`[ERROR]` продолжают выводиться в `stderr` |
+| `off` или иное | отладочные уровни (`[DEBUG]`/`[INFO]`/`[MATCH]`/`[PROCESSED]`/`[FILTERED]`) отключены; `[WARN]`/`[ERROR]` направляются в системный лог (`openlog`/`vsyslog`, `LOG_DAEMON`, тег `"hrneo"`) — чтобы критичные сообщения не терялись в `stderr` демона |
 
 **Уровни логов:**
 
@@ -272,17 +272,20 @@ GeoSiteFile=/opt/etc/x-ui/bin/geosite.dat
 
 ### `ConntrackFlush=true`
 
-Сбрасывать соединения `conntrack` при первом добавлении IP в `ipset`.
+Сбрасывать соединения `conntrack` при первом добавлении IP в `ipset`. Флаг управляет обоими каналами (DNS и L7), но механизм сброса у них разный.
 
-- `true` (по умолчанию) — при первом добавлении IP в `ipset` (`NLM_F_EXCL` вернул `err=0`) hrneo делает netlink-DUMP `conntrack`-таблицы и отправляет `DELETE` для каждой записи, у которой dst-IP совпадает с только что добавленным. Это нужно, чтобы уже установленное соединение к этому IP получило новый `fwmark` при следующем пакете и ушло через нужный туннель/интерфейс
-- фактический сброс происходит **ТОЛЬКО** при одновременном выполнении трёх условий:
+- `true` (по умолчанию):
+  - **DNS-канал** — при первом добавлении IP (`NLM_F_EXCL` вернул `err=0`) hrneo делает netlink-DUMP `conntrack`-таблицы и отправляет `DELETE` для каждой записи, у которой dst-IP совпадает с только что добавленным. Это нужно, чтобы уже установленное соединение к этому IP получило новый `fwmark` при следующем пакете и ушло через нужный туннель/интерфейс
+  - **L7-канал** (TLS-SNI / HTTP-Host) — при первом добавлении IP удаляет **одну** conntrack-запись триггернувшего соединения точечно по полному 5-tuple (`conntrack_delete_conn`, без DUMP таблицы, без коллатерали для чужих соединений к тому же IP). L7 ловит ClientHello уже установленного соединения, поэтому запись всегда существует и удаляется
+- фактический сброс происходит **ТОЛЬКО** при одновременном выполнении условий:
   1. `ConntrackFlush=true`
   2. IP добавлен в `ipset` впервые (повторное добавление того же IP no-op — `NLM_F_EXCL` → `IPSET_ERR_EXIST`)
-  3. существует активная `conntrack`-запись с `dst==этот IP`
+  3. (DNS) существует активная `conntrack`-запись с `dst==этот IP`; для L7 это условие выполняется по построению
 
-  Если соединения к IP ещё нет — DUMP проходит вхолостую, DELETE не отправляется.
-- `false` — не выполнять `conntrack flush`; соединения, установленные ДО добавления IP в `ipset`, продолжат идти с прежним `fwmark` до переподключения
-- `fork/exec` не используется — всё через прямой netlink-сокет (`NETLINK_NETFILTER`, long-lived, открыт один раз при старте)
+  Для DNS, если соединения к IP ещё нет — DUMP проходит вхолостую, DELETE не отправляется.
+- `false` — не выполнять `conntrack`-сброс **ни на одном канале**; соединения, установленные ДО добавления IP в `ipset`, продолжат идти с прежним `fwmark` до переподключения. Для L7 это означает, что трафик к свежеопознанному хосту останется в обход политики до реконнекта приложением
+- ранее L7-канал вместо conntrack использовал инъекцию TCP RST (`l7_rst.c`), не зависевшую от `ConntrackFlush`. Механизм удалён: spoof-RST как in-band-пакет проигрывал гонку seq-окна (RFC 5961) и на практике не рвал соединение. Теперь L7 использует надёжный conntrack-DELETE, единообразно подчинённый флагу `ConntrackFlush`
+- `fork/exec` не используется — всё через прямые netlink-сокеты (`NETLINK_NETFILTER`, long-lived, открыты один раз при старте): отдельный сокет под DUMP-поток и отдельный под `DELETE` (исключает рассинхрон чтения ответа из недочитанного DUMP)
 
 ---
 
@@ -445,7 +448,7 @@ Content-Type: application/json
 
 - пересоздаёт `CONNMARK`-правила в `mangle/PREROUTING` на текущей конфигурации в памяти (config, watchlist и GeoSite не перечитываются)
 - обновляет состояние интерфейсов (`up`/`down`) для DirectRoute и корректирует маршруты
-- если `l7CaptureEnabled=true` и L7-перехват успешно стартовал — заново ставит `NFQUEUE`-правила для портов 80/443 на WAN-интерфейс (idempotent через `iptables -C`); при `l7CaptureEnabled=false` шаг пропускается
+- если `l7CaptureEnabled=true` и L7-перехват успешно стартовал — заново ставит `NFLOG`-правила для портов 80/443 на WAN-интерфейс в `mangle/FORWARD`+`OUTPUT` (idempotent через `iptables -C`); при `l7CaptureEnabled=false` шаг пропускается
 - **debounce:** повторный `SIGUSR1` во время обработки предыдущего откладывается на 5 секунд
 - отправляется автоматически хуком `/opt/etc/ndm/netfilter.d/015-hrneo.sh` при изменении `mangle`-таблицы роутером Keenetic
 
@@ -454,7 +457,7 @@ Content-Type: application/json
 Штатная остановка:
 
 - удаляются `iptables`/`ip6tables` `CONNMARK`-правила
-- снимаются L7 `NFQUEUE`-правила (если были установлены)
+- снимаются L7 `NFLOG`-правила (если были установлены)
 - удаляются `ip rule` и `ip route` для DirectRoute-интерфейсов
 - закрывается `ipset` netlink-сокет
 - удаляется PID-файл
@@ -463,27 +466,32 @@ Content-Type: application/json
 
 ## L7-перехват HTTP/HTTPS
 
-### `l7CaptureEnabled=true`
+### `l7CaptureEnabled=false`
 
 Главный выключатель L7-механизма (TLS SNI + HTTP Host).
 
-- `false` — поведение идентично релизам без L7: DNS-only мониторинг, `NFQUEUE`-правила не ставятся, netlink-сокет очереди не открывается, kernel-модуль `xt_connbytes` не загружается, дополнительной CPU-нагрузки нет
-- `true` (по умолчанию) — параллельно с DNS-каналом hrneo:
-  1. резолвит WAN-интерфейс (см. `l7WanInterface`)
-  2. загружает kernel-модуль `xt_connbytes` через syscall `init_module` (если ещё не загружен; путь `/lib/modules/$(uname -r)/xt_connbytes.ko`)
-  3. открывает `NFQUEUE` через `NETLINK_NETFILTER` на `l7QueueNum`
-  4. добавляет в `iptables`/`ip6tables` `mangle/POSTROUTING` правила пересылки первых 2..N пакетов TCP-потока (`dport 443` и `80`) в очередь `NFQUEUE`
-  5. на каждый пакет парсит TLS ClientHello (SNI) либо HTTP Host
-  6. при совпадении имени с watchlist — destination-IP попадает в соответствующий `ipset` так же, как DNS-ответ; дальше обычная цепочка `CONNMARK`/маршрутизации
+- `false` (по умолчанию) — поведение идентично релизам без L7: DNS-only мониторинг, `NFLOG`-правила не ставятся, netlink-сокет не открывается, kernel-модули `nfnetlink_log`/`xt_NFLOG`/`xt_connbytes` не загружаются, дополнительной CPU-нагрузки нет
+- `true` — параллельно с DNS-каналом hrneo:
+  1. резолвит WAN-интерфейс (см. `l7WanInterface`); при неудаче — L7 отключается, DNS-only
+  2. загружает kernel-модули `nfnetlink_log` и `xt_NFLOG` через syscall `init_module` (пути `/lib/modules/$(uname -r)/*.ko`); **fallback отсутствует** — если модули недоступны, L7 полностью отключается с `[WARN]`, демон продолжает работу только на DNS-канале
+  3. загружает `xt_connbytes` (если ещё не загружен)
+  4. открывает `NFLOG`-сокет через `NETLINK_NETFILTER` на группе `l7NflogGroup`
+  5. добавляет в `iptables`/`ip6tables` `mangle/FORWARD` и `mangle/OUTPUT` правила копирования первых 2..N пакетов TCP-потока (`dport 443` и `80`) в `NFLOG`-группу
+  6. на каждую копию парсит TLS ClientHello (SNI) либо HTTP Host
+  7. при совпадении имени с watchlist — destination-IP попадает в соответствующий `ipset` так же, как DNS-ответ; дальше обычная цепочка `CONNMARK`/маршрутизации
+  8. при **первом** добавлении этого IP (он был выпущен через WAN до попадания в ipset) и при `ConntrackFlush=true` hrneo точечно удаляет conntrack-запись триггернувшего соединения по 5-tuple — соединение реконнектится через политику, а не остаётся в обход неё до таймаута
+- `NFLOG` — нетерминирующая цель: пакет только копируется и продолжает обычный путь, hrneo его не модифицирует. Это делает L7-канал совместимым с DPI-десинхронизаторами (zapret2 / nfqws2 / tpws), которые используют `NFQUEUE` на той же машине, — взаимного «голодания» по трафику нет (разбор — `CONFLICT_ZAPRET2.md`)
+- разрыв триггернувшего соединения подчинён флагу `ConntrackFlush` (см. раздел «Conntrack»): при `ConntrackFlush=false` L7 не сбрасывает соединение, и трафик к хосту остаётся в обход политики до реконнекта приложением. Удаляется только триггернувшее соединение, точечно по 5-tuple, без полного DUMP таблицы
 - закрывает «слепые зоны» DNS-only схемы: клиенты с DoH/DoT/DoQ, hardcoded-IP с TLS SNI, легаси-HTTP
 - расшифровка DoH/DoT/DoQ/ECH невозможна (требует MITM) и не делается
 - горячее переключение не поддерживается; смена флага требует `/opt/etc/init.d/S99hrneo restart`
 
-### `l7QueueNum=210`
+### `l7NflogGroup=210`
 
-Номер `NFQUEUE` для L7-перехвата.
+Номер `NFLOG`-группы для L7-перехвата.
 
-- пространство номеров глобальное (netfilter); при конфликте с zapret/nfqws/tpws задать любое непересекающееся (диапазон `0..65535`)
+- пространство групп `NFLOG` отдельное от номеров `NFQUEUE` (общего конфликта с zapret/nfqws/tpws нет); при совпадении с другим потребителем NFLOG на этой же машине задать любое непересекающееся значение (диапазон `0..65535`)
+- группу `0` лучше не использовать: её часто занимает штатный лог/ulogd
 
 ### `l7EnableTLS=true`
 
@@ -534,8 +542,8 @@ Content-Type: application/json
 - `true` (по умолчанию) — для каждого TLS-соединения, у которого в первом полученном пакете `record_len > payload_len`, создаётся запись в хеш-таблице по 5-tuple (`saddr:sport:daddr:dport:family`). Последующие пакеты с правильным следующим TCP `seq` дописываются; при достижении `record_len` запускается `tls_extract_sni` на собранном буфере, и при совпадении с watchlist destination-IP попадает в `ipset` с тегом `[TLS-SNI]`
 - `false` — длинные ClientHello (Kyber/MLKEM) игнорируются; fast-path для коротких CH (помещающихся в один TCP-сегмент) продолжает работать. Можно использовать для regression-сравнения или экономии памяти на маломощных роутерах
 - имеет эффект только при `l7CaptureEnabled=true` и `l7EnableTLS=true`
-- **out-of-order TCP-сегменты** (`next seq > expected`): запись удаляется, счётчик `stat_drop_gap`. На стабильных каналах client→server такое практически не встречается; out-of-order reasm с heap'ом отложен в подфазу 2.1
-- **ретрансмиссии** (`seq < expected`): тихо игнорируются, счётчик `stat_retransmit`
+- **out-of-order TCP-сегменты** (`next seq > expected`): запись удаляется. На стабильных каналах client→server такое практически не встречается; out-of-order reasm с heap'ом отложен в подфазу 2.1
+- **ретрансмиссии** (`seq < expected`): тихо игнорируются
 
 ### `l7TcpReasmMaxEntries=256`
 
@@ -543,37 +551,41 @@ Content-Type: application/json
 
 - допустимый диапазон `1..256` (`TCP_REASM_MAX_ENTRY`)
 - память: ~16 KB на запись (`TCP_REASM_BUF_SIZE`) + ~80 байт overhead. При `max=256` hrneo занимает дополнительно ~4 MB heap. При `max=64` — 1 MB
-- при достижении лимита срабатывает LRU-eviction: удаляется самая старая запись по `ts_added`, счётчик `stat_evicted`. Под нормальной нагрузкой (50–200 conn/s) eviction не должен происходить — это индикатор настройки слишком маленького `max` или нагрузки выше ожидаемой
+- при достижении лимита срабатывает LRU-eviction: удаляется самая старая запись по `ts_added`. Под нормальной нагрузкой (50–200 conn/s) eviction не должен происходить — это индикатор настройки слишком маленького `max` или нагрузки выше ожидаемой
 - установка в `0` или отсутствие параметра — используется значение по умолчанию `256`
 
 ### `l7TcpReasmTtlSec=5`
 
 TTL неполных записей в секундах.
 
-- раз в секунду срабатывает `timerfd`, hrneo сканирует все buckets и удаляет записи старше TTL (счётчик `stat_expired`)
+- раз в секунду срабатывает `timerfd`, hrneo сканирует все buckets и удаляет записи старше TTL
 - 5 сек с запасом покрывают типичный TLS handshake; больше не нужно, т.к. правило firewall пропускает только первые 2..8 пакетов flow
-- при значимом `stat_expired` стоит проверить health сети (RTT, потери); в норме значение должно быть около нуля
+- частые удаления по TTL (недособранные ClientHello) — индикатор проблем сети (RTT, потери); в норме их быть почти не должно
 
 ---
 
 ## Системные требования для `l7CaptureEnabled=true`
 
-- `iptables`/`ip6tables` с поддержкой матчей `connbytes`, `length`, `tcp` + target `NFQUEUE`
-- kernel-модули `xt_NFQUEUE`, `nfnetlink_queue` (обычно уже загружены)
-- kernel-модуль `xt_connbytes` — на Keenetic присутствует в `/lib/modules`, но не автозагружается; hrneo подгружает сам через syscall `init_module`
-- демон запущен от root (доступ к `NETLINK_NETFILTER`, `AF_PACKET`, `init_module`)
+- `iptables`/`ip6tables` с поддержкой матчей `connbytes`, `length`, `tcp` + target `NFLOG`
+- kernel-модули `nfnetlink_log`, `xt_NFLOG` — на Keenetic присутствуют в `/lib/modules`, но не автозагружаются; hrneo подгружает сам через syscall `init_module` (порядок: `nfnetlink_log`, затем `xt_NFLOG`). Если их нет — L7 отключается **без fallback**, демон работает на DNS-канале
+- kernel-модуль `xt_connbytes` — аналогично, hrneo подгружает сам через `init_module`
+- демон запущен от root (доступ к `NETLINK_NETFILTER` для NFLOG и conntrack-DELETE, `AF_PACKET`, `init_module`)
 
 ### Лог-сообщения L7 при старте
 
 ```
 [INFO]  L7 WAN interface: eth3
+[INFO]  kmod nfnetlink_log loaded
+[INFO]  kmod xt_NFLOG loaded
 [INFO]  kmod xt_connbytes loaded
-[INFO]  L7 firewall rules installed (new=4, already present=0, wan=eth3)
-[INFO]  L7 capture enabled, NFQ #210 (TLS=1 HTTP=1)
-[WARN]  L7 capture: WAN interface unknown; disabling L7
-[WARN]  L7 firewall install failed; closing NFQ
+[INFO]  L7 firewall rules installed (new=8, already present=0, wan=eth3, nflog-group=210)
+[INFO]  L7 capture enabled via NFLOG group #210 (TLS=1 HTTP=1)
+[WARN]  L7 capture: WAN interface unknown; L7 disabled, DNS-only mode
+[WARN]  L7 capture: NFLOG kernel modules unavailable; L7 disabled, DNS-only mode
+[WARN]  L7 firewall install failed; closing NFLOG, DNS-only mode
 [MATCH] [TLS-SNI] target.example -> HydraRoute
 [PROCESSED] [TLS-SNI] target.example -> 1.2.3.4 [HydraRoute]
+[DEBUG] conntrack: deleted L7 conn (family 2)
 [MATCH] [HTTP-Host] legacy.example -> Other
 [MATCH] [DNS] target.example -> HydraRoute
 ```

@@ -1,0 +1,8 @@
+Package: hrneo
+Version: @VERSION@
+Architecture: @ARCH@
+Depends: libc, ipset, iptables, ip-full
+Installed-Size: @INSTALLED_SIZE@
+Maintainer: Ground_Zerro
+Description: DNS-based policy routing daemon for Keenetic
+Section: net

@@ -13,7 +13,7 @@
 #include "../include/conntrack.h"
 #include "../include/geodat.h"
 #include "../include/routing.h"
-#include "../include/nfq_capture.h"
+#include "../include/nflog_capture.h"
 #include "../include/l7_dispatch.h"
 #include "../include/l7_firewall.h"
 #include "../include/tcp_reasm.h"
@@ -37,9 +37,9 @@ static direct_route_manager_t g_drm;
 static int g_drm_active;
 static unified_target_t g_all_sorted[MAX_POLICY_ORDER + MAX_INTERFACES];
 static int g_all_sorted_count;
-static conntrack_mgr_t g_conntrack = { .fd = -1 };
+static conntrack_mgr_t g_conntrack = { .fd = -1, .del_fd = -1 };
 static rci_client_t g_rci;
-static nfq_capture_t g_nfq;
+static nflog_capture_t g_nflog;
 static int g_l7_active;
 static char g_l7_wan[MAX_INTERFACE_NAME];
 static tcp_reasm_t g_reasm;
@@ -84,17 +84,10 @@ static void remove_pid_file(const char *path) {
 }
 
 static int initialize_ipsets(ipset_manager_t *mgr, const ipset_pair_t *pairs, int count,
-                             int clear, int enable_timeout, int timeout, uint32_t maxelem) {
+                             int clear, uint32_t timeout, uint32_t maxelem) {
     for (int i = 0; i < count; i++) {
-        uint32_t to = (enable_timeout && timeout > 0) ? (uint32_t)timeout : 0;
-
-        ipset_create(mgr, pairs[i].ipv4, IPSET_HASH_TYPE, AF_INET, to, maxelem);
-        ipset_create(mgr, pairs[i].ipv6, IPSET_HASH_TYPE, AF_INET6, to, maxelem);
-
-        if (enable_timeout && timeout > 0) {
-            ipset_cache_timeout_for_set(mgr, pairs[i].ipv4, 1, (uint32_t)timeout);
-            ipset_cache_timeout_for_set(mgr, pairs[i].ipv6, 1, (uint32_t)timeout);
-        }
+        ipset_create(mgr, pairs[i].ipv4, IPSET_HASH_TYPE, AF_INET, timeout, maxelem);
+        ipset_create(mgr, pairs[i].ipv6, IPSET_HASH_TYPE, AF_INET6, timeout, maxelem);
 
         if (clear) {
             ipset_flush(mgr, pairs[i].ipv4);
@@ -114,18 +107,18 @@ static void format_ipv6(const uint8_t *ip, char *buf, int buf_size) {
     snprintf(buf, buf_size, "%s", tmp);
 }
 
-static void process_hostname_event(const char *domain,
-                                   const cname_entry_t *cnames, int cname_count,
+static int process_hostname_event(const char *domain,
+                                   const dns_cname_t *cnames, int cname_count,
                                    const parsed_cidr_t *ipv4_batch, int ipv4_count,
                                    const parsed_cidr_t *ipv6_batch, int ipv6_count,
-                                   const char *source_tag) {
+                                   const char *source_tag, int allow_conntrack_flush) {
     const char *matched_domain = NULL;
     const char *ipset_name = match_domain_with_cname(
         g_all_targets,
         (const char (*)[64])g_config.policy_order, g_config.policy_order_count,
         domain, cnames, cname_count, &matched_domain);
 
-    if (!ipset_name) return;
+    if (!ipset_name) return 0;
 
     if (matched_domain && matched_domain != domain)
         LOG_MATCH("[%s] %s via %s -> %s", source_tag, domain, matched_domain, ipset_name);
@@ -165,29 +158,34 @@ static void process_hostname_event(const char *domain,
         }
     }
 
-    if (g_config.conntrack_flush && all_new_count > 0) {
+    if (allow_conntrack_flush && g_config.conntrack_flush && all_new_count > 0) {
         conntrack_flush_for_ips(&g_conntrack, all_new, all_new_count);
     }
+
+    return all_new_count;
 }
 
 void process_hostname_event_l7(const char *host, int proto,
-                               const uint8_t *daddr, int family) {
+                               const l7_conn_t *conn) {
     parsed_cidr_t entry;
     memset(&entry, 0, sizeof(entry));
+    const char *tag = (proto == L7_TLS) ? "TLS-SNI" : "HTTP-Host";
+    int new_count;
 
-    if (family == AF_INET) {
-        memcpy(entry.ip, daddr, 4);
+    if (conn->family == AF_INET) {
+        memcpy(entry.ip, conn->server_ip, 4);
         entry.prefix = 32;
         entry.family = AF_INET;
-        const char *tag = (proto == L7_TLS) ? "TLS-SNI" : "HTTP-Host";
-        process_hostname_event(host, NULL, 0, &entry, 1, NULL, 0, tag);
+        new_count = process_hostname_event(host, NULL, 0, &entry, 1, NULL, 0, tag, 0);
     } else {
-        memcpy(entry.ip, daddr, 16);
+        memcpy(entry.ip, conn->server_ip, 16);
         entry.prefix = 128;
         entry.family = AF_INET6;
-        const char *tag = (proto == L7_TLS) ? "TLS-SNI" : "HTTP-Host";
-        process_hostname_event(host, NULL, 0, NULL, 0, &entry, 1, tag);
+        new_count = process_hostname_event(host, NULL, 0, NULL, 0, &entry, 1, tag, 0);
     }
+
+    if (new_count > 0 && g_config.conntrack_flush)
+        conntrack_delete_conn(&g_conntrack, conn);
 }
 
 static void process_dns_packet(const uint8_t *pkt, int pkt_len, void *user_data) {
@@ -201,16 +199,6 @@ static void process_dns_packet(const uint8_t *pkt, int pkt_len, void *user_data)
 
     char processed[64][256];
     int processed_count = 0;
-
-    static cname_entry_t cnames[DNS_MAX_CNAMES];
-    int cname_total = result.cname_count;
-    if (cname_total > DNS_MAX_CNAMES) cname_total = DNS_MAX_CNAMES;
-    for (int c = 0; c < cname_total; c++) {
-        strncpy(cnames[c].from, result.cnames[c].source, 255);
-        cnames[c].from[255] = '\0';
-        strncpy(cnames[c].to, result.cnames[c].target, 255);
-        cnames[c].to[255] = '\0';
-    }
 
     for (int i = 0; i < result.answer_count; i++) {
         const char *domain = result.answers[i].domain;
@@ -247,10 +235,10 @@ static void process_dns_packet(const uint8_t *pkt, int pkt_len, void *user_data)
             }
         }
 
-        process_hostname_event(domain, cnames, cname_total,
+        process_hostname_event(domain, result.cnames, result.cname_count,
                                ipv4_batch, ipv4_count,
                                ipv6_batch, ipv6_count,
-                               "DNS");
+                               "DNS", 1);
     }
 }
 
@@ -364,10 +352,12 @@ int main(int argc, char *argv[]) {
             LOG_INFO("CIDR: added policy '%s'", policy_names[i]);
     }
 
+    geosite_rule_t gs_rules[256];
+    int gs_count = 0;
     if (g_config.geo_site_file_count > 0) {
         int pc_before = policy_count;
-        geosite_rule_t gs_rules[256];
-        int gs_count = parse_geosite_rules(g_config.watchlist_path, gs_rules, 256);
+        gs_count = parse_geosite_rules(g_config.watchlist_path, gs_rules, 256);
+        if (gs_count < 0) gs_count = 0;
         for (int i = 0; i < gs_count; i++) {
             if (g_drm_active && drm_classify_target(&g_drm, gs_rules[i].policy_name))
                 continue;
@@ -436,36 +426,28 @@ int main(int argc, char *argv[]) {
     }
 
     {
+        g_ipset_mgr.default_timeout =
+            (g_config.ipset_enable_timeout && g_config.ipset_timeout > 0)
+                ? (uint32_t)g_config.ipset_timeout : 0;
         ipset_pair_t init_pairs[MAX_POLICY_ORDER + MAX_INTERFACES];
         for (int i = 0; i < g_all_sorted_count; i++)
             init_pairs[i] = g_all_sorted[i].pair;
         initialize_ipsets(&g_ipset_mgr, init_pairs, g_all_sorted_count,
-                          g_config.clear_ipset, g_config.ipset_enable_timeout, g_config.ipset_timeout,
+                          g_config.clear_ipset, g_ipset_mgr.default_timeout,
                           (uint32_t)g_config.ipset_maxelem);
     }
 
     if (g_config.cidr_enabled && g_config.cidr_file_path[0] != '\0') {
-        ipset_pair_t all_pairs[MAX_POLICY_ORDER + MAX_INTERFACES];
-        for (int i = 0; i < g_all_sorted_count; i++)
-            all_pairs[i] = g_all_sorted[i].pair;
-
         add_cidr_to_ipsets(&g_ipset_mgr, g_config.cidr_file_path,
-                           all_pairs, g_all_sorted_count,
-                           g_config.ipset_enable_timeout, g_config.ipset_timeout,
                            (const char (*)[512])g_config.geo_ip_files, g_config.geo_ip_file_count,
                            (uint32_t)g_config.ipset_maxelem);
     }
 
-    if (g_config.geo_site_file_count > 0) {
-        geosite_rule_t geosite_rules[256];
-        int geosite_rule_count = parse_geosite_rules(g_config.watchlist_path,
-                                                     geosite_rules, 256);
-        if (geosite_rule_count > 0) {
-            build_geosite_domain_map(
-                (const char (*)[512])g_config.geo_site_files, g_config.geo_site_file_count,
-                geosite_rules, geosite_rule_count,
-                g_all_targets);
-        }
+    if (gs_count > 0) {
+        build_geosite_domain_map(
+            (const char (*)[512])g_config.geo_site_files, g_config.geo_site_file_count,
+            gs_rules, gs_count,
+            g_all_targets);
     }
 
     if (g_drm_active) {
@@ -489,7 +471,9 @@ int main(int argc, char *argv[]) {
 
     if (g_config.l7_capture_enabled) {
         if (l7_firewall_resolve_wan(&g_config, g_l7_wan, sizeof(g_l7_wan)) != 0) {
-            LOG_WARN("L7 capture: WAN interface unknown; disabling L7");
+            LOG_WARN("L7 capture: WAN interface unknown; L7 disabled, DNS-only mode");
+        } else if (l7_firewall_load_nflog_modules() != 0) {
+            LOG_WARN("L7 capture: NFLOG kernel modules unavailable; L7 disabled, DNS-only mode");
         } else {
             LOG_INFO("L7 WAN interface: %s", g_l7_wan);
             l7_firewall_load_kmod("xt_connbytes");
@@ -511,16 +495,16 @@ int main(int argc, char *argv[]) {
                 LOG_INFO("TCP reassembly disabled (l7TcpReasmEnabled=false)");
             }
 
-            if (nfq_capture_init(&g_nfq, (uint16_t)g_config.l7_queue_num,
-                                 l7_dispatch_packet, NULL) == 0) {
+            if (nflog_capture_init(&g_nflog, (uint16_t)g_config.l7_nflog_group,
+                                   l7_dispatch_packet, NULL) == 0) {
                 if (l7_firewall_install(&g_config, g_l7_wan) == 0) {
                     g_l7_active = 1;
-                    LOG_INFO("L7 capture enabled, NFQ #%d (TLS=%d HTTP=%d)",
-                             g_config.l7_queue_num,
+                    LOG_INFO("L7 capture enabled via NFLOG group #%d (TLS=%d HTTP=%d)",
+                             g_config.l7_nflog_group,
                              g_config.l7_enable_tls, g_config.l7_enable_http);
                 } else {
-                    LOG_WARN("L7 firewall install failed; closing NFQ");
-                    nfq_capture_close(&g_nfq);
+                    LOG_WARN("L7 firewall install failed; closing NFLOG, DNS-only mode");
+                    nflog_capture_close(&g_nflog);
                 }
             } else {
                 LOG_WARN("L7 capture init failed; continuing with DNS only");
@@ -555,11 +539,11 @@ int main(int argc, char *argv[]) {
     ev.data.fd = signals.timer_fd;
     epoll_ctl(epfd, EPOLL_CTL_ADD, signals.timer_fd, &ev);
 
-    int nfq_fd = -1;
+    int nflog_fd = -1;
     if (g_l7_active) {
-        nfq_fd = nfq_capture_fd(&g_nfq);
-        ev.data.fd = nfq_fd;
-        epoll_ctl(epfd, EPOLL_CTL_ADD, nfq_fd, &ev);
+        nflog_fd = nflog_capture_fd(&g_nflog);
+        ev.data.fd = nflog_fd;
+        epoll_ctl(epfd, EPOLL_CTL_ADD, nflog_fd, &ev);
     }
 
     int reasm_gc_fd = -1;
@@ -593,8 +577,8 @@ int main(int argc, char *argv[]) {
         for (int i = 0; i < n; i++) {
             if (events[i].data.fd == cap.fd4 || events[i].data.fd == cap.fd6) {
                 pkt_capture_process(&cap, events[i].data.fd);
-            } else if (g_l7_active && events[i].data.fd == nfq_fd) {
-                nfq_capture_process(&g_nfq);
+            } else if (g_l7_active && events[i].data.fd == nflog_fd) {
+                nflog_capture_process(&g_nflog);
             } else if (reasm_gc_fd >= 0 && events[i].data.fd == reasm_gc_fd) {
                 uint64_t exp;
                 ssize_t r = read(reasm_gc_fd, &exp, sizeof(exp));
@@ -613,7 +597,7 @@ int main(int argc, char *argv[]) {
                             timer_active = 1;
                             pending_update = 0;
                             perform_update();
-                            signal_mgr_arm_timer(&signals, 5);
+                            signal_mgr_arm_timer(&signals, SIGUSR1_DEBOUNCE_SEC);
                         } else {
                             LOG_INFO("SIGUSR1 received during timer, deferring update...");
                             pending_update = 1;
@@ -642,7 +626,7 @@ cleanup_signals:
 cleanup_capture:
     if (g_l7_active) {
         l7_firewall_remove(&g_config, g_l7_wan);
-        nfq_capture_close(&g_nfq);
+        nflog_capture_close(&g_nflog);
         g_l7_active = 0;
     }
     if (g_reasm_active) {

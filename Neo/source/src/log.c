@@ -48,6 +48,8 @@ int log_setup(const config_t *cfg) {
         log_syslog = 1;
         log_enabled = 1;
     } else {
+        openlog("hrneo", LOG_PID | LOG_NDELAY, LOG_DAEMON);
+        log_syslog = 1;
         log_fp = NULL;
         log_enabled = 0;
     }

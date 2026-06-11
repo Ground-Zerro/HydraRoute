@@ -1,0 +1,13 @@
+#!/bin/sh
+RED='\033[0;31m'
+YELLOW='\033[0;33m'
+RESET='\033[0m'
+ln -sf /opt/etc/init.d/S99hrneo /opt/bin/neo
+if [ -f /opt/etc/init.d/rc.unslung ] &&
+   ! grep -q '\[ $ACTION = start \] && sleep 10' /opt/etc/init.d/rc.unslung
+then
+    sed -i '/\[ $ACTION = stop -o $ACTION = restart -o $ACTION = kill \] && ORDER="-r"/a[ $ACTION = start ] && sleep 10' /opt/etc/init.d/rc.unslung
+fi
+/opt/etc/init.d/S99hrneo stop > /dev/null 2>&1
+/opt/etc/init.d/S99hrneo start || printf "${RED}[WARN]${RESET} Failed to start the HR Neo service\n"
+exit 0

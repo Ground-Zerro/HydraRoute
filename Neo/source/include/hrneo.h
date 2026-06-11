@@ -9,7 +9,6 @@
 #define DEFAULT_PID_FILE          "/var/run/hrneo.pid"
 #define DEFAULT_API_PORT          79
 #define IPSET_HASH_TYPE           "hash:net"
-#define MANGLE_TABLE              "mangle"
 #define SOCKET_READ_BUFFER        (1024 * 1024)
 #define SIGUSR1_DEBOUNCE_SEC      5
 #define RCI_TIMEOUT_SEC           10
@@ -36,7 +35,6 @@
 #define IPSET_ATTR_IPADDR_IPV6  2
 #define IPSET_ATTR_CIDR         3
 #define IPSET_ATTR_TIMEOUT      6
-#define IPSET_ATTR_HASHSIZE     18
 #define IPSET_ATTR_MAXELEM      19
 #define NLA_F_NESTED            (1 << 15)
 #define NLA_F_NET_BYTEORDER     (1 << 14)
@@ -50,8 +48,14 @@
 #define CT_MSG_DELETE      2
 #define CTA_TUPLE_ORIG     1
 #define CTA_TUPLE_IP       1
+#define CTA_TUPLE_PROTO    2
+#define CTA_IPV4_SRC       1
 #define CTA_IPV4_DST       2
+#define CTA_IPV6_SRC       3
 #define CTA_IPV6_DST       4
+#define CTA_PROTO_NUM      1
+#define CTA_PROTO_SRC_PORT 2
+#define CTA_PROTO_DST_PORT 3
 
 #define MAX_GEO_FILES       16
 #define MAX_POLICY_ORDER    64
@@ -88,7 +92,7 @@ typedef struct {
     char policy_order[MAX_POLICY_ORDER][64];
     int policy_order_count;
     int l7_capture_enabled;
-    int l7_queue_num;
+    int l7_nflog_group;
     int l7_enable_tls;
     int l7_enable_http;
     int l7_connbytes_max;
@@ -188,10 +192,5 @@ typedef struct {
     int next_fwmark;
     int next_table_id;
 } direct_route_manager_t;
-
-typedef struct {
-    char from[256];
-    char to[256];
-} cname_entry_t;
 
 #endif

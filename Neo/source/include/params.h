@@ -2,15 +2,13 @@
 #define PARAMS_H
 
 #include "hrneo.h"
-#include "config.h"
-#include "args.h"
 #include <stddef.h>
 #include <stdint.h>
 
 /* One row per configurable parameter — single source of truth driving
  * config_read (key=val), args_parse (--flag val), args_apply (CLI→config),
  * and print_help. Adding a new parameter requires only an entry here plus
- * a matching field in both config_t and cli_args_t. */
+ * a matching field in config_t. */
 typedef enum {
     PT_BOOL,
     PT_INT,
@@ -27,8 +25,6 @@ typedef struct {
     param_type_t   type;
     size_t         cfg_offset;        /* offsetof(config_t, ...) */
     size_t         cfg_count_offset;  /* array count field; 0 if N/A */
-    size_t         args_offset;       /* offsetof(cli_args_t, ...) */
-    size_t         args_count_offset; /* 0 if N/A */
     uint32_t       set_bit;           /* bit in cli_args_t.set_mask */
     size_t         buf_size;          /* STRING/PATH buffer size */
     int            default_int;       /* BOOL/INT default */
@@ -39,5 +35,7 @@ typedef struct {
 
 extern const param_def_t PARAMS[];
 extern const int PARAMS_COUNT;
+
+int param_apply(config_t *cfg, const param_def_t *p, const char *val, int strict);
 
 #endif

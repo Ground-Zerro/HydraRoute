@@ -1,10 +1,7 @@
 #include "../include/args.h"
 #include "../include/params.h"
-#include "../include/util.h"
 #include <stdio.h>
 #include <string.h>
-#include <stdlib.h>
-#include <errno.h>
 
 #define HELP_FLAG_WIDTH 33
 
@@ -31,73 +28,6 @@ static void print_help(void) {
     printf("  %-*s  %s\n", HELP_FLAG_WIDTH, "--version, -v", "Print version and exit");
     printf("  %-*s  %s\n", HELP_FLAG_WIDTH, "--help, -h",    "Print this help and exit");
     printf("\nPriority: CLI flags > config file > built-in defaults\n");
-}
-
-static int parse_int(const char *val, int *out, int must_be_positive) {
-    char *end;
-    errno = 0;
-    long v = strtol(val, &end, 10);
-    if (errno != 0 || *end != '\0' || end == val) return -1;
-    if (must_be_positive && v <= 0) return -1;
-    *out = (int)v;
-    return 0;
-}
-
-static int apply_cli_value(cli_args_t *args, const param_def_t *p, const char *val) {
-    void *field = (char *)args + p->args_offset;
-
-    switch (p->type) {
-    case PT_BOOL:
-        if (strcmp(val, "true") == 0)  { *(int *)field = 1; return 0; }
-        if (strcmp(val, "false") == 0) { *(int *)field = 0; return 0; }
-        return -1;
-
-    case PT_INT:
-        return parse_int(val, (int *)field, 0);
-
-    case PT_INT_POS:
-        return parse_int(val, (int *)field, 1);
-
-    case PT_STRING:
-    case PT_PATH: {
-        char *buf = (char *)field;
-        strncpy(buf, val, p->buf_size - 1);
-        buf[p->buf_size - 1] = '\0';
-        return 0;
-    }
-
-    case PT_REPEAT_PATH: {
-        int *cnt = (int *)((char *)args + p->args_count_offset);
-        if (*cnt < MAX_GEO_FILES) {
-            char (*arr)[MAX_PATH_LEN] = (char (*)[MAX_PATH_LEN])field;
-            strncpy(arr[*cnt], val, p->buf_size - 1);
-            arr[*cnt][p->buf_size - 1] = '\0';
-            (*cnt)++;
-        }
-        return 0;
-    }
-
-    case PT_POLICY_ORDER: {
-        int *cnt = (int *)((char *)args + p->args_count_offset);
-        char (*arr)[64] = (char (*)[64])field;
-        char tmp[4096];
-        strncpy(tmp, val, sizeof(tmp) - 1);
-        tmp[sizeof(tmp) - 1] = '\0';
-        char *saveptr;
-        char *token = strtok_r(tmp, ",", &saveptr);
-        while (token && *cnt < MAX_POLICY_ORDER) {
-            char *t = trim_whitespace(token);
-            if (t[0] != '\0') {
-                strncpy(arr[*cnt], t, 63);
-                arr[*cnt][63] = '\0';
-                (*cnt)++;
-            }
-            token = strtok_r(NULL, ",", &saveptr);
-        }
-        return 0;
-    }
-    }
-    return -1;
 }
 
 int args_parse(int argc, char *argv[], cli_args_t *out) {
@@ -148,7 +78,7 @@ int args_parse(int argc, char *argv[], cli_args_t *out) {
         }
         const char *val = argv[++i];
 
-        if (apply_cli_value(out, p, val) != 0) {
+        if (param_apply(&out->overlay, p, val, 1) != 0) {
             fprintf(stderr, "hrneo: invalid value '%s' for %s\n", val, arg);
             return -1;
         }
@@ -159,51 +89,38 @@ int args_parse(int argc, char *argv[], cli_args_t *out) {
 }
 
 void args_apply(const cli_args_t *args, config_t *cfg) {
+    const config_t *src = &args->overlay;
+
     for (int i = 0; i < PARAMS_COUNT; i++) {
         const param_def_t *p = &PARAMS[i];
         if (!(args->set_mask & p->set_bit)) continue;
 
-        void *cfg_field = (char *)cfg + p->cfg_offset;
-        const void *args_field = (const char *)args + p->args_offset;
+        void *dst_field = (char *)cfg + p->cfg_offset;
+        const void *src_field = (const char *)src + p->cfg_offset;
 
         switch (p->type) {
         case PT_BOOL:
         case PT_INT:
         case PT_INT_POS:
-            *(int *)cfg_field = *(const int *)args_field;
+            *(int *)dst_field = *(const int *)src_field;
             break;
 
         case PT_STRING:
-        case PT_PATH: {
-            char *dst = (char *)cfg_field;
-            strncpy(dst, (const char *)args_field, p->buf_size - 1);
-            dst[p->buf_size - 1] = '\0';
+        case PT_PATH:
+            memcpy(dst_field, src_field, p->buf_size);
             break;
-        }
 
         case PT_REPEAT_PATH: {
-            int *cfg_cnt = (int *)((char *)cfg + p->cfg_count_offset);
-            const int *args_cnt = (const int *)((const char *)args + p->args_count_offset);
-            *cfg_cnt = *args_cnt;
-            char (*cfg_arr)[MAX_PATH_LEN] = (char (*)[MAX_PATH_LEN])cfg_field;
-            const char (*args_arr)[MAX_PATH_LEN] = (const char (*)[MAX_PATH_LEN])args_field;
-            for (int j = 0; j < *args_cnt; j++) {
-                strncpy(cfg_arr[j], args_arr[j], p->buf_size - 1);
-                cfg_arr[j][p->buf_size - 1] = '\0';
-            }
+            int n = *(const int *)((const char *)src + p->cfg_count_offset);
+            memcpy(dst_field, src_field, (size_t)n * MAX_PATH_LEN);
+            *(int *)((char *)cfg + p->cfg_count_offset) = n;
             break;
         }
 
         case PT_POLICY_ORDER: {
-            int *cfg_cnt = (int *)((char *)cfg + p->cfg_count_offset);
-            const int *args_cnt = (const int *)((const char *)args + p->args_count_offset);
-            *cfg_cnt = *args_cnt;
-            char (*cfg_arr)[64] = (char (*)[64])cfg_field;
-            const char (*args_arr)[64] = (const char (*)[64])args_field;
-            for (int j = 0; j < *args_cnt; j++) {
-                strncpy(cfg_arr[j], args_arr[j], 63);
-                cfg_arr[j][63] = '\0';
-            }
+            int n = *(const int *)((const char *)src + p->cfg_count_offset);
+            memcpy(dst_field, src_field, (size_t)n * 64);
+            *(int *)((char *)cfg + p->cfg_count_offset) = n;
             break;
         }
         }

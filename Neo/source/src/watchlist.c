@@ -96,104 +96,53 @@ int get_unique_names(const domain_hashtable_t *ht, char names[][64], int max_nam
     return count;
 }
 
-static int cmp_str64(const void *a, const void *b) {
-    return strcmp((const char *)a, (const char *)b);
-}
-
-void sort_policies(char names[][64], int count, const char order[][64], int order_count) {
-    if (count == 0) return;
-
-    if (order_count == 0) {
-        qsort(names, count, 64, cmp_str64);
-        return;
-    }
-
-    char result[MAX_POLICY_ORDER][64];
-    int result_count = 0;
-    int used[MAX_POLICY_ORDER];
-    memset(used, 0, sizeof(used));
-
-    for (int i = 0; i < order_count && result_count < count; i++) {
-        int found = 0;
-        for (int j = 0; j < count; j++) {
-            if (strcmp(names[j], order[i]) == 0) {
-                found = 1;
-                if (!used[j]) {
-                    strncpy(result[result_count++], names[j], 63);
-                    result[result_count - 1][63] = '\0';
-                    used[j] = 1;
-                }
-                break;
-            }
-        }
-        if (!found) {
-            LOG_WARN("PolicyOrder: policy '%s' not found, skipping", order[i]);
-        }
-    }
-
-    char remaining[MAX_POLICY_ORDER][64];
-    int rem_count = 0;
-    for (int j = 0; j < count; j++) {
-        if (!used[j]) {
-            strncpy(remaining[rem_count++], names[j], 63);
-            remaining[rem_count - 1][63] = '\0';
-        }
-    }
-    qsort(remaining, rem_count, 64, cmp_str64);
-
-    for (int i = 0; i < rem_count && result_count < count; i++) {
-        strncpy(result[result_count++], remaining[i], 63);
-        result[result_count - 1][63] = '\0';
-    }
-
-    memcpy(names, result, count * 64);
-}
-
-int parse_cidr_policy_headers(const char *path, char names[][64], int max_names) {
-    FILE *f = fopen(path, "r");
-    if (!f) {
-        LOG_ERROR("Cannot open CIDR file: %s", path);
-        return 0;
-    }
-
-    int count = 0;
-    char *line = NULL;
-    size_t cap = 0;
-    while (getline(&line, &cap, f) != -1) {
-        char *trimmed = trim_whitespace(line);
-        if (trimmed[0] == '\0' || strncmp(trimmed, "##", 2) == 0 || strncmp(trimmed, "#/", 2) == 0)
-            continue;
-
-        if (trimmed[0] == '/') {
-            char *name = trim_whitespace(trimmed + 1);
-            if (name[0] == '\0') continue;
-
-            int found = 0;
-            for (int j = 0; j < count; j++) {
-                if (strcmp(names[j], name) == 0) {
-                    found = 1;
-                    break;
-                }
-            }
-            if (!found && count < max_names) {
-                strncpy(names[count], name, 63);
-                names[count][63] = '\0';
-                count++;
-            }
-        }
-    }
-
-    free(line);
-    fclose(f);
-    return count;
-}
-
 static int get_policy_priority(const char (*policy_order)[64], int order_count, const char *name) {
     for (int i = 0; i < order_count; i++) {
         if (strcmp(policy_order[i], name) == 0)
             return i;
     }
     return order_count;
+}
+
+typedef struct {
+    int priority;
+    char name[64];
+} policy_sort_entry_t;
+
+static int cmp_policy_entry(const void *a, const void *b) {
+    const policy_sort_entry_t *pa = (const policy_sort_entry_t *)a;
+    const policy_sort_entry_t *pb = (const policy_sort_entry_t *)b;
+    if (pa->priority != pb->priority)
+        return pa->priority - pb->priority;
+    return strcmp(pa->name, pb->name);
+}
+
+void sort_policies(char names[][64], int count, const char order[][64], int order_count) {
+    if (count <= 0 || count > MAX_POLICY_ORDER + MAX_INTERFACES)
+        return;
+
+    policy_sort_entry_t entries[MAX_POLICY_ORDER + MAX_INTERFACES];
+    for (int i = 0; i < count; i++) {
+        entries[i].priority = get_policy_priority(order, order_count, names[i]);
+        memcpy(entries[i].name, names[i], 64);
+    }
+
+    for (int i = 0; i < order_count; i++) {
+        int found = 0;
+        for (int j = 0; j < count; j++) {
+            if (strcmp(names[j], order[i]) == 0) {
+                found = 1;
+                break;
+            }
+        }
+        if (!found)
+            LOG_WARN("PolicyOrder: policy '%s' not found, skipping", order[i]);
+    }
+
+    qsort(entries, count, sizeof(entries[0]), cmp_policy_entry);
+
+    for (int i = 0; i < count; i++)
+        memcpy(names[i], entries[i].name, 64);
 }
 
 static const char *match_domain(const domain_hashtable_t *ht,
@@ -235,7 +184,7 @@ static const char *match_domain(const domain_hashtable_t *ht,
 const char *match_domain_with_cname(const domain_hashtable_t *ht,
                                     const char (*policy_order)[64], int order_count,
                                     const char *domain,
-                                    const cname_entry_t *cnames, int cname_count,
+                                    const dns_cname_t *cnames, int cname_count,
                                     const char **matched_domain) {
     const char *queue[MAX_CNAME_CHAIN];
     uint32_t visited_hashes[MAX_CNAME_CHAIN];
@@ -263,11 +212,11 @@ const char *match_domain_with_cname(const domain_hashtable_t *ht,
         }
 
         for (int i = 0; i < cname_count; i++) {
-            if (strcmp(cnames[i].from, current) == 0) {
-                if (tail < MAX_CNAME_CHAIN) queue[tail++] = cnames[i].to;
+            if (strcmp(cnames[i].source, current) == 0) {
+                if (tail < MAX_CNAME_CHAIN) queue[tail++] = cnames[i].target;
             }
-            if (strcmp(cnames[i].to, current) == 0) {
-                if (tail < MAX_CNAME_CHAIN) queue[tail++] = cnames[i].from;
+            if (strcmp(cnames[i].target, current) == 0) {
+                if (tail < MAX_CNAME_CHAIN) queue[tail++] = cnames[i].source;
             }
         }
     }

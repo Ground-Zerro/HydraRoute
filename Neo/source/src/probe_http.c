@@ -42,9 +42,7 @@ int http_extract_host(const uint8_t *data, size_t len, char *host, size_t host_s
     if (p >= e) return 0;
 
     const uint8_t *s = p;
-    int in_brackets = 0;
     if (*s == '[') {
-        in_brackets = 1;
         const uint8_t *q = s + 1;
         while (q < e && *q != ']' && *q != '\r' && *q != '\n') q++;
         if (q < e && *q == ']') s = q + 1;
@@ -63,7 +61,5 @@ int http_extract_host(const uint8_t *data, size_t len, char *host, size_t host_s
         host[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : (char)c;
     }
     host[slen] = '\0';
-
-    (void)in_brackets;
     return 1;
 }

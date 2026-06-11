@@ -5,44 +5,30 @@
 #include <string.h>
 #include <unistd.h>
 
-static int get_br0_networks(char *ipv4_net, int ipv4_size, char *ipv6_net, int ipv6_size) {
-    ipv4_net[0] = '\0';
+static void get_br0_global_ipv6(char *ipv6_net, int ipv6_size) {
     ipv6_net[0] = '\0';
 
     char *argv[] = {"ip", "addr", "show", "br0", NULL};
     char output[4096];
-    int ret = run_command_output("ip", argv, output, sizeof(output));
-    if (ret != 0) {
+    if (run_command_output("ip", argv, output, sizeof(output)) != 0) {
         LOG_ERROR("ip addr show br0 failed");
-        return -1;
+        return;
     }
 
     char *saveptr;
     char *line = strtok_r(output, "\n", &saveptr);
     while (line) {
         while (*line == ' ' || *line == '\t') line++;
-        if (strncmp(line, "inet ", 5) == 0 && ipv4_net[0] == '\0') {
-            char *addr = line + 5;
-            char *sp = strchr(addr, ' ');
-            if (sp) *sp = '\0';
-            strncpy(ipv4_net, addr, ipv4_size - 1);
-            ipv4_net[ipv4_size - 1] = '\0';
-        } else if (strncmp(line, "inet6 ", 6) == 0 && strstr(line, "scope global") && ipv6_net[0] == '\0') {
+        if (strncmp(line, "inet6 ", 6) == 0 && strstr(line, "scope global")) {
             char *addr = line + 6;
             char *sp = strchr(addr, ' ');
             if (sp) *sp = '\0';
             strncpy(ipv6_net, addr, ipv6_size - 1);
             ipv6_net[ipv6_size - 1] = '\0';
+            return;
         }
         line = strtok_r(NULL, "\n", &saveptr);
     }
-
-    if (ipv4_net[0] == '\0') {
-        LOG_ERROR("No IPv4 address found for br0");
-        return -1;
-    }
-
-    return 0;
 }
 
 static const char *find_mark_in_rules(const char *rules_output, const char *ipset_name) {
@@ -114,10 +100,19 @@ static void remove_connmark_rules_for(const char *ipt_cmd, const char *ipset_nam
     }
 }
 
+typedef struct {
+    const char *ipt_cmd;
+    const char *restore_cmd;
+    char rules_cache[16384];
+    char batch[8192];
+    int  off;
+    int  rule_count;
+} connmark_family_t;
+
 int apply_unified_connmark_rules(rci_client_t *rci, const unified_target_t *targets,
                                  int count, int global_routing) {
-    char ipv4_net[64], ipv6_net[64];
-    get_br0_networks(ipv4_net, sizeof(ipv4_net), ipv6_net, sizeof(ipv6_net));
+    char ipv6_net[64];
+    get_br0_global_ipv6(ipv6_net, sizeof(ipv6_net));
 
     policy_mark_t policies[MAX_POLICY_ORDER];
     int policy_count = -1;
@@ -151,19 +146,20 @@ int apply_unified_connmark_rules(rci_client_t *rci, const unified_target_t *targ
         sleep(4);
     }
 
-    char ipv4_rules_cache[16384], ipv6_rules_cache[16384];
-    {
-        char *argv4[] = {"iptables", "-w", "-t", "mangle", "-S", "PREROUTING", NULL};
-        run_command_output("iptables", argv4, ipv4_rules_cache, sizeof(ipv4_rules_cache));
-        char *argv6[] = {"ip6tables", "-w", "-t", "mangle", "-S", "PREROUTING", NULL};
-        run_command_output("ip6tables", argv6, ipv6_rules_cache, sizeof(ipv6_rules_cache));
+    static connmark_family_t fams[2] = {
+        { .ipt_cmd = "iptables",  .restore_cmd = "iptables-restore"  },
+        { .ipt_cmd = "ip6tables", .restore_cmd = "ip6tables-restore" },
+    };
+
+    for (int fi = 0; fi < 2; fi++) {
+        connmark_family_t *fam = &fams[fi];
+        char *argv[] = {(char *)fam->ipt_cmd, "-w", "-t", "mangle", "-S", "PREROUTING", NULL};
+        run_command_output(fam->ipt_cmd, argv, fam->rules_cache, sizeof(fam->rules_cache));
+        fam->off = snprintf(fam->batch, sizeof(fam->batch), "*mangle\n");
+        fam->rule_count = 0;
     }
 
-    char ipv4_batch[8192], ipv6_batch[8192];
-    int ipv4_off = 0, ipv6_off = 0;
-    ipv4_off += snprintf(ipv4_batch + ipv4_off, sizeof(ipv4_batch) - ipv4_off, "*mangle\n");
-    ipv6_off += snprintf(ipv6_batch + ipv6_off, sizeof(ipv6_batch) - ipv6_off, "*mangle\n");
-    int ipv4_rule_count = 0, ipv6_rule_count = 0;
+    const char *pkt_cond = global_routing ? "" : "-m mark ! --mark 0xffffaa0/0xffffff0 ";
 
     for (int i = 0; i < count; i++) {
         char mark_hex[16] = {0};
@@ -183,65 +179,44 @@ int apply_unified_connmark_rules(rci_client_t *rci, const unified_target_t *targ
             }
         }
 
-        const char *current_mark = find_mark_in_rules(ipv4_rules_cache, targets[i].pair.ipv4);
-        if (current_mark && strcmp(current_mark, mark_hex) == 0) {
-            LOG_DEBUG("Rule for %s is current (mark: %s)", targets[i].pair.ipv4, mark_hex);
-        } else {
+        for (int fi = 0; fi < 2; fi++) {
+            connmark_family_t *fam = &fams[fi];
+            const char *set_name = (fi == 0) ? targets[i].pair.ipv4 : targets[i].pair.ipv6;
+
+            const char *current_mark = find_mark_in_rules(fam->rules_cache, set_name);
+            if (current_mark && strcmp(current_mark, mark_hex) == 0) {
+                LOG_DEBUG("Rule for %s is current (mark: %s)", set_name, mark_hex);
+                continue;
+            }
+            if (fi == 1 && !targets[i].is_interface && ipv6_net[0] == '\0')
+                continue;
+
             if (current_mark) {
                 LOG_INFO("Mark changed for %s: %s -> %s, recreating",
-                         targets[i].pair.ipv4, current_mark, mark_hex);
-                remove_connmark_rules_for("iptables", targets[i].pair.ipv4);
+                         set_name, current_mark, mark_hex);
+                remove_connmark_rules_for(fam->ipt_cmd, set_name);
             }
 
-            const char *pkt_cond = global_routing ? "" : "-m mark ! --mark 0xffffaa0/0xffffff0 ";
-            ipv4_off += snprintf(ipv4_batch + ipv4_off, sizeof(ipv4_batch) - ipv4_off,
+            fam->off += snprintf(fam->batch + fam->off, sizeof(fam->batch) - fam->off,
                 "-A PREROUTING %s-m connmark --mark 0x0/0xffff0000 -m set --match-set %s dst -j CONNMARK --set-xmark 0x%s/0xffffffff\n",
-                pkt_cond, targets[i].pair.ipv4, mark_hex);
-            ipv4_off += snprintf(ipv4_batch + ipv4_off, sizeof(ipv4_batch) - ipv4_off,
+                pkt_cond, set_name, mark_hex);
+            fam->off += snprintf(fam->batch + fam->off, sizeof(fam->batch) - fam->off,
                 "-A PREROUTING -m set --match-set %s dst -j CONNMARK --restore-mark --nfmask 0xffffffff --ctmask 0xffffffff\n",
-                targets[i].pair.ipv4);
-            ipv4_rule_count++;
-            LOG_INFO("Adding rules for %s (mark: 0x%s) via iptables-restore",
-                     targets[i].pair.ipv4, mark_hex);
-        }
-
-        current_mark = find_mark_in_rules(ipv6_rules_cache, targets[i].pair.ipv6);
-        if (current_mark && strcmp(current_mark, mark_hex) == 0) {
-            LOG_DEBUG("Rule for %s is current (mark: %s)", targets[i].pair.ipv6, mark_hex);
-        } else {
-            if (targets[i].is_interface || ipv6_net[0] != '\0') {
-                if (current_mark) {
-                    remove_connmark_rules_for("ip6tables", targets[i].pair.ipv6);
-                }
-
-                const char *pkt_cond = global_routing ? "" : "-m mark ! --mark 0xffffaa0/0xffffff0 ";
-                ipv6_off += snprintf(ipv6_batch + ipv6_off, sizeof(ipv6_batch) - ipv6_off,
-                    "-A PREROUTING %s-m connmark --mark 0x0/0xffff0000 -m set --match-set %s dst -j CONNMARK --set-xmark 0x%s/0xffffffff\n",
-                    pkt_cond, targets[i].pair.ipv6, mark_hex);
-                ipv6_off += snprintf(ipv6_batch + ipv6_off, sizeof(ipv6_batch) - ipv6_off,
-                    "-A PREROUTING -m set --match-set %s dst -j CONNMARK --restore-mark --nfmask 0xffffffff --ctmask 0xffffffff\n",
-                    targets[i].pair.ipv6);
-                ipv6_rule_count++;
-                LOG_INFO("Adding rules for %s (mark: 0x%s) via ip6tables-restore",
-                         targets[i].pair.ipv6, mark_hex);
-            }
+                set_name);
+            fam->rule_count++;
+            LOG_INFO("Adding rules for %s (mark: 0x%s) via %s",
+                     set_name, mark_hex, fam->restore_cmd);
         }
     }
 
-    if (ipv4_rule_count > 0) {
-        ipv4_off += snprintf(ipv4_batch + ipv4_off, sizeof(ipv4_batch) - ipv4_off, "COMMIT\n");
-        char *argv[] = {"iptables-restore", "--noflush", NULL};
-        int ret = run_command_stdin("iptables-restore", argv, ipv4_batch, ipv4_off);
-        if (ret != 0) LOG_ERROR("iptables-restore failed (exit %d)", ret);
-        else LOG_DEBUG("Applied %d CONNMARK rules via iptables-restore", ipv4_rule_count);
-    }
-
-    if (ipv6_rule_count > 0) {
-        ipv6_off += snprintf(ipv6_batch + ipv6_off, sizeof(ipv6_batch) - ipv6_off, "COMMIT\n");
-        char *argv[] = {"ip6tables-restore", "--noflush", NULL};
-        int ret = run_command_stdin("ip6tables-restore", argv, ipv6_batch, ipv6_off);
-        if (ret != 0) LOG_ERROR("ip6tables-restore failed (exit %d)", ret);
-        else LOG_DEBUG("Applied %d CONNMARK rules via ip6tables-restore", ipv6_rule_count);
+    for (int fi = 0; fi < 2; fi++) {
+        connmark_family_t *fam = &fams[fi];
+        if (fam->rule_count == 0) continue;
+        fam->off += snprintf(fam->batch + fam->off, sizeof(fam->batch) - fam->off, "COMMIT\n");
+        char *argv[] = {(char *)fam->restore_cmd, "--noflush", NULL};
+        int ret = run_command_stdin(fam->restore_cmd, argv, fam->batch, fam->off);
+        if (ret != 0) LOG_ERROR("%s failed (exit %d)", fam->restore_cmd, ret);
+        else LOG_DEBUG("Applied %d CONNMARK rules via %s", fam->rule_count, fam->restore_cmd);
     }
 
     return 0;

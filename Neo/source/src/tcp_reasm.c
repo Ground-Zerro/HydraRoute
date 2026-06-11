@@ -52,13 +52,12 @@ static tcp_reasm_entry_t *pool_alloc(tcp_reasm_t *r) {
     return NULL;
 }
 
-static void entry_release(tcp_reasm_t *r, tcp_reasm_entry_t **link) {
+static void entry_release(tcp_reasm_entry_t **link) {
     tcp_reasm_entry_t *e = *link;
     *link = e->next;
     e->in_use = 0;
     e->next = NULL;
     e->buf_len = 0;
-    r->count--;
 }
 
 static tcp_reasm_entry_t *evict_lru(tcp_reasm_t *r) {
@@ -77,10 +76,8 @@ static tcp_reasm_entry_t *evict_lru(tcp_reasm_t *r) {
             link = &(*link)->next;
         }
     }
-    if (oldest) {
-        entry_release(r, oldest_link);
-        r->stat_evicted++;
-    }
+    if (oldest)
+        entry_release(oldest_link);
     return oldest;
 }
 
@@ -106,18 +103,17 @@ int tcp_reasm_start(tcp_reasm_t *r, const tcp_reasm_key_t *k,
                     const uint8_t *payload, size_t len,
                     size_t record_len, uint32_t seq) {
     if (!r->pool) return -1;
-    if (record_len > TCP_REASM_BUF_SIZE) { r->stat_too_big++; return -1; }
+    if (record_len > TCP_REASM_BUF_SIZE) return -1;
     if (len == 0 || len > TCP_REASM_BUF_SIZE) return -1;
 
     int bucket;
     tcp_reasm_entry_t **prev_link;
     tcp_reasm_entry_t *existing = bucket_find(r, k, &prev_link, &bucket);
-    if (existing) entry_release(r, prev_link);
+    if (existing) entry_release(prev_link);
 
     tcp_reasm_entry_t *e = pool_alloc(r);
     if (!e) {
-        if (!evict_lru(r)) return -1;
-        e = pool_alloc(r);
+        e = evict_lru(r);
         if (!e) return -1;
     }
 
@@ -131,8 +127,6 @@ int tcp_reasm_start(tcp_reasm_t *r, const tcp_reasm_key_t *k,
 
     e->next = r->buckets[bucket];
     r->buckets[bucket] = e;
-    r->count++;
-    r->stat_started++;
     return 0;
 }
 
@@ -150,15 +144,13 @@ int tcp_reasm_feed(tcp_reasm_t *r, const tcp_reasm_key_t *k,
     if (!e) return -1;
 
     int32_t diff = (int32_t)(seq - e->expected_seq);
-    if (diff < 0) { r->stat_retransmit++; return 0; }
+    if (diff < 0) return 0;
     if (diff > 0) {
-        entry_release(r, link);
-        r->stat_drop_gap++;
+        entry_release(link);
         return 0;
     }
     if (e->buf_len + len > TCP_REASM_BUF_SIZE) {
-        entry_release(r, link);
-        r->stat_too_big++;
+        entry_release(link);
         return 0;
     }
     memcpy(e->buf + e->buf_len, payload, len);
@@ -187,11 +179,8 @@ int tcp_reasm_get(tcp_reasm_t *r, const tcp_reasm_key_t *k,
 void tcp_reasm_destroy(tcp_reasm_t *r, const tcp_reasm_key_t *k) {
     if (!r->pool) return;
     tcp_reasm_entry_t **link = NULL;
-    tcp_reasm_entry_t *e = bucket_find(r, k, &link, NULL);
-    if (e) {
-        if (e->buf_len >= e->record_len) r->stat_completed++;
-        entry_release(r, link);
-    }
+    if (bucket_find(r, k, &link, NULL))
+        entry_release(link);
 }
 
 void tcp_reasm_gc(tcp_reasm_t *r) {
@@ -201,8 +190,7 @@ void tcp_reasm_gc(tcp_reasm_t *r) {
         tcp_reasm_entry_t **link = &r->buckets[b];
         while (*link) {
             if (now - (*link)->ts_added >= r->ttl_ns) {
-                entry_release(r, link);
-                r->stat_expired++;
+                entry_release(link);
             } else {
                 link = &(*link)->next;
             }

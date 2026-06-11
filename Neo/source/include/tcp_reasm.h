@@ -22,17 +22,8 @@ typedef struct tcp_reasm_entry tcp_reasm_entry_t;
 typedef struct tcp_reasm {
     tcp_reasm_entry_t *pool;
     int                pool_size;
-    int                count;
     int64_t            ttl_ns;
     tcp_reasm_entry_t *buckets[TCP_REASM_BUCKETS];
-
-    uint64_t stat_started;
-    uint64_t stat_completed;
-    uint64_t stat_evicted;
-    uint64_t stat_expired;
-    uint64_t stat_drop_gap;
-    uint64_t stat_too_big;
-    uint64_t stat_retransmit;
 } tcp_reasm_t;
 
 int  tcp_reasm_init   (tcp_reasm_t *r, int max_entries, int ttl_sec);

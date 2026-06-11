@@ -1,7 +1,6 @@
 #ifndef DNS_H
 #define DNS_H
 
-#include "hrneo.h"
 #include <stdint.h>
 #include <netinet/in.h>
 

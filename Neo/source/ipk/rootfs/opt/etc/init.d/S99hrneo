@@ -1,0 +1,11 @@
+#!/bin/sh
+
+ENABLED=yes
+PROCS=hrneo
+ARGS=""
+PREARGS=""
+DESC="HydraRoute Neo daemon"
+PATH=/opt/sbin:/opt/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+PIDFILE=/var/run/hrneo.pid
+
+. /opt/etc/init.d/rc.func

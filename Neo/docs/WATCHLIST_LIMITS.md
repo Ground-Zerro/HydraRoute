@@ -1,6 +1,7 @@
 # Предельные размеры watchlist в hrneo
 
-**Версия кода:** hrneo 3.11.0-1
+**Версия кода:** hrneo 3.12.0-1
+**Источник:** статический анализ `src/*.c`, `include/*.h`
 
 ---
 
@@ -37,7 +38,7 @@
 | Параметр | Значение | Назначение |
 |----------|----------|------------|
 | `NAME_INDEX_SLOTS` | 256 | Open-addressed FNV-1a индексы для `batches[]` / `usage[]` |
-| `CIDR_MIGRATE_MAX_LINES` | 16 384 | Лимит строк в `ip.list` при автомиграции oversized geoip |
+| `CIDR_MIGRATE_HEADROOM` | 5 000 | Запас под `IpsetMaxElem` для порога автомиграции oversized geoip |
 | `CIDR_MIGRATE_MAX_BLOCKS` | 512 | Лимит блоков `/Name` в `ip.list` при автомиграции |
 | `geosite_rule_t gs_rules[256]` | 256 | Лимит строк `geosite:TAG/...` в `domain.conf` (буфер в `main.c`) |
 
@@ -56,9 +57,9 @@
 | `TCP_REASM_BUCKETS` | 64 | `tcp_reasm.h` | Бакетов в хеш-таблице реассамблеции |
 | `TCP_REASM_MAX_ENTRY` | 256 | `tcp_reasm.h` | Жёсткий потолок одновременно буферизуемых соединений (значение `l7TcpReasmMaxEntries` clamp'ится сюда) |
 | `TCP_REASM_BUF_SIZE` | 16 КБ | `tcp_reasm.h` | Буфер на одну реассемблируемую запись |
-| `NFQ_RECV_BUF_SIZE` | 128 КБ | `nfq_capture.h` | Буфер приёма NFQUEUE (`nfq_capture_t.recv_buf[]`) |
-| `NFQ_QUEUE_MAXLEN` | 1024 | `nfq_capture.h` | Максимум пакетов в очереди NFQUEUE на стороне ядра |
-| `NFQ_COPY_RANGE` | 0xFFFF | `nfq_capture.h` | Сколько байт пакета копировать из ядра в userspace |
+| `NFLOG_RECV_BUF_SIZE` | 128 КБ | `nflog_capture.h` | Буфер приёма NFLOG (`nflog_capture_t.recv_buf[]`) |
+| `NFLOG_NLBUFSIZ` | 128 КБ | `nflog_capture.h` | Размер кольца NFLOG-группы на стороне ядра (`NFULA_CFG_NLBUFSIZ`) |
+| `NFLOG_COPY_RANGE` | 0xFFFF | `nflog_capture.h` | Сколько байт пакета копировать из ядра в userspace |
 
 ### 1.6 RCI-клиент (`include/rci.h`)
 
@@ -93,13 +94,13 @@
 | `domain_hashtable_t` | ~68 КБ | `buckets[8192]` (64 КБ) + `ipset_name_cache[64][64]` (4 КБ) + `ipset_name_ptrs[64]` (512 байт) |
 | `ipset_manager_t` | ~34 КБ | `set_names[512][64]` (32 КБ) + `set_has_timeout[256]` (1 КБ) + `timeout_value[256]` (1 КБ) |
 | `rci_client_t` буферы | ~2 МБ | `raw_buf` (1 МБ + 4 КБ) + `response_buf` (1 МБ); выделяются при старте, переиспользуются весь lifetime |
-| `nfq_capture_t.recv_buf` | 128 КБ | только при `l7CaptureEnabled=true` |
+| `nflog_capture_t.recv_buf` | 128 КБ | только при `l7CaptureEnabled=true` |
 | `tcp_reasm_t` пул | до 4 МБ | `l7TcpReasmMaxEntries × TCP_REASM_BUF_SIZE` = до 256 × 16 КБ; **при `l7TcpReasmEnabled=false` память не выделяется вообще** |
 | `g_all_sorted[]` | ~17 КБ | `unified_target_t[128]` (`MAX_POLICY_ORDER + MAX_INTERFACES`) |
 
-**Итого базовый расход при дефолтном конфиге** (`l7CaptureEnabled=true`, `l7TcpReasmMaxEntries=256`): ≈ **6.5 МБ heap/data**.
+**Итого базовый расход при дефолтном конфиге** (`l7CaptureEnabled=false` — L7-канал выключен по умолчанию): ≈ **2.5 МБ heap/data** (без NFLOG-буфера и без `tcp_reasm` пула).
 
-При `l7CaptureEnabled=false`: ≈ **2.5 МБ** (без NFQ-буфера и без `tcp_reasm` пула).
+При `l7CaptureEnabled=true` (`l7TcpReasmMaxEntries=256`): ≈ **6.5 МБ** (добавляются 128 КБ NFLOG-буфера и до 4 МБ пула `tcp_reasm`).
 
 ---
 
@@ -169,11 +170,13 @@
 
 ### 5.1 Лимиты при автомиграции oversized geoip
 
-Срабатывает фаза 1 в `add_cidr_to_ipsets` при `geoip_count > 0`:
+Срабатывает фаза 1 в `add_cidr_to_ipsets` при `geoip_count > 0`. Тег с числом
+записей больше `IpsetMaxElem − 5000` (`CIDR_MIGRATE_HEADROOM`) переносится в
+disabled-блок `#/Too-big-geoip-tag`:
 
-- Не более **16 384 строк** в `ip.list` обрабатывается за одну миграцию (`CIDR_MIGRATE_MAX_LINES`)
+- Строки читаются полностью в динамически растущий массив (`getline()`, старт 4096, ×2), лимита числа строк нет
 - Не более **512 блоков** `/Name` или `#/Name` (`CIDR_MIGRATE_MAX_BLOCKS`)
-- Превышение → миграция возвращает `-1` без переписывания файла
+- Превышение числа блоков → миграция возвращает `-1` без переписывания файла
 
 ### 5.2 Лимиты при обычной загрузке
 
@@ -191,9 +194,10 @@
 - Одновременно буферизуемых TCP-соединений (фрагментированных ClientHello): **`l7TcpReasmMaxEntries`** (default 256, clamp до `TCP_REASM_MAX_ENTRY=256`)
 - Размер буфера на одно соединение: **16 КБ** (`TCP_REASM_BUF_SIZE`); если ClientHello превышает 16 КБ → `stat_too_big`, запись освобождается
 - TTL неполных записей: **`l7TcpReasmTtlSec`** секунд (default 5)
-- Пакетов в очереди NFQUEUE на стороне ядра: **1024** (`NFQ_QUEUE_MAXLEN`); переполнение → `ENOBUFS` → `LOG_WARN`, не fatal
+- Кольцо NFLOG-группы на стороне ядра: **128 КБ** (`NFLOG_NLBUFSIZ`); переполнение → `ENOBUFS` → `LOG_WARN`, копии теряются (мягкая деградация — трафик клиента не страдает), не fatal
 - Окно `connbytes` для `dport 443`: первые **`l7ConnbytesMax`** пакетов после SYN (default 8); для `dport 80` ужимается до `min(N, 4)`
 - WAN-интерфейс **один** (`l7WanInterface` или автодетект из `/proc/net/route`)
+- RST-инъекция (`src/l7_rst.c`): два raw-сокета (v4 `IPPROTO_RAW`, v6 `IPPROTO_TCP`) **без буферов и без лимитов** — RST крафтится на стеке (40 байт v4 / 60 байт v6) и отправляется единичным `sendto`; на потолок watchlist не влияет
 
 ---
 
@@ -216,7 +220,7 @@
 | **`domain.conf`** (явные домены) | Память ÷ 64 байта | 100–200 тыс. на 128 МБ; 300–500 тыс. на 256 МБ |
 | **`geo.dat`** (один тег) | Пиково ≈ 100 байт/домен | 200–500 тыс. доменов на тег |
 | **`geo.dat`** (все теги суммарно) | Память ÷ 64 байта | Тот же общий бюджет, что у `domain.conf` |
-| **`ip.list`** (при миграции oversized) | 16 384 строки / 512 блоков | Не приближаться к лимиту |
+| **`ip.list`** (при миграции oversized) | без лимита строк / 512 блоков | потоковое чтение, динамический массив |
 | **Политик** | 64 (`MAX_POLICY_ORDER`) | 64 (жёстко) |
 | **Интерфейсов DirectRoute** | 64 (`MAX_INTERFACES`) | 64 (жёстко) |
 | **`geosite:` строк в `domain.conf`** | 256 | 256 (жёстко) |

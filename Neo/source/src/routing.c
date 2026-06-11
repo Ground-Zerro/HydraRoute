@@ -150,60 +150,62 @@ static int add_blackhole(int table_id, int ipv6) {
     return ret;
 }
 
-static int drm_add_default_route(direct_route_manager_t *drm, const char *iface_name,
-                                 int table_id, int ipv6) {
-    const char *state = "unknown";
+static int drm_iface_active(const char *state) {
+    return strcmp(state, "up") == 0 || strcmp(state, "unknown") == 0;
+}
+
+static const char *drm_lookup_state(const direct_route_manager_t *drm, const char *iface_name) {
     for (int i = 0; i < drm->interface_count; i++) {
-        if (strcmp(drm->interfaces[i].name, iface_name) == 0) {
-            state = drm->interfaces[i].state;
-            break;
-        }
+        if (strcmp(drm->interfaces[i].name, iface_name) == 0)
+            return drm->interfaces[i].state;
+    }
+    return "unknown";
+}
+
+static void drm_install_route(const char *iface_name, int table_id, int active, int ipv6) {
+    if (!active) {
+        add_blackhole(table_id, ipv6);
+        return;
     }
 
     char table_str[16];
     snprintf(table_str, sizeof(table_str), "%d", table_id);
     char output[512];
-    int is_active = (strcmp(state, "up") == 0 || strcmp(state, "unknown") == 0);
+    const char *tail[] = { "route", "add", "default", "dev", iface_name,
+                           "table", table_str, NULL };
+    int ret = run_ip(ipv6, tail, output, sizeof(output));
 
-    if (is_active) {
-        const char *tail[] = { "route", "add", "default", "dev", iface_name,
-                               "table", table_str, NULL };
-        int ret = run_ip(ipv6, tail, output, sizeof(output));
-
-        if (ret != 0) {
-            if (strstr(output, "File exists"))
-                return 0;
-            if (strstr(output, "can't find device")) {
-                LOG_WARN("Interface %s not in kernel routing stack, using blackhole", iface_name);
-                add_blackhole(table_id, ipv6);
-                return 0;
-            }
-            LOG_WARN("Failed to add route for %s: %s", iface_name, output);
-            return -1;
-        }
+    if (ret == 0) {
         LOG_INFO("Added route (%s): default dev %s table %d",
                  ipv6 ? "IPv6" : "IPv4", iface_name, table_id);
-    } else {
-        add_blackhole(table_id, ipv6);
-        LOG_WARN("Interface %s is DOWN, using blackhole route", iface_name);
+        return;
     }
-
-    return 0;
+    if (strstr(output, "File exists"))
+        return;
+    if (strstr(output, "can't find device")) {
+        LOG_WARN("Interface %s not in kernel routing stack (%s), using blackhole",
+                 iface_name, ipv6 ? "IPv6" : "IPv4");
+        add_blackhole(table_id, ipv6);
+        return;
+    }
+    LOG_WARN("Failed to add route for %s: %s", iface_name, output);
 }
 
 int drm_setup_all_routes(direct_route_manager_t *drm) {
     for (int i = 0; i < drm->route_count; i++) {
         interface_route_t *r = &drm->routes[i];
+        int active = drm_iface_active(drm_lookup_state(drm, r->interface_name));
+        if (!active)
+            LOG_WARN("Interface %s is DOWN, using blackhole route", r->interface_name);
         for (int v6 = 0; v6 <= 1; v6++) {
             drm_create_ip_rule(drm, r->fwmark, r->table_id, v6);
-            drm_add_default_route(drm, r->interface_name, r->table_id, v6);
+            drm_install_route(r->interface_name, r->table_id, active, v6);
         }
     }
     return 0;
 }
 
-static int drm_flush_routing_table(direct_route_manager_t *drm, int table_id) {
-    (void)drm;
+static int drm_flush_routing_table(int table_id) {
     char table_str[16];
     snprintf(table_str, sizeof(table_str), "%d", table_id);
     char output[256];
@@ -216,34 +218,18 @@ static int drm_flush_routing_table(direct_route_manager_t *drm, int table_id) {
     return 0;
 }
 
-static int drm_update_route_on_state_change(direct_route_manager_t *drm,
-                                            const char *iface_name, int table_id,
+static int drm_update_route_on_state_change(const char *iface_name, int table_id,
                                             const char *new_state) {
-    drm_flush_routing_table(drm, table_id);
+    drm_flush_routing_table(table_id);
 
-    char table_str[16];
-    snprintf(table_str, sizeof(table_str), "%d", table_id);
-    char output[512];
+    int active = drm_iface_active(new_state);
+    for (int v6 = 0; v6 <= 1; v6++)
+        drm_install_route(iface_name, table_id, active, v6);
 
-    int is_active = (strcmp(new_state, "up") == 0 || strcmp(new_state, "unknown") == 0);
-
-    if (is_active) {
-        const char *tail[] = { "route", "add", "default", "dev", iface_name,
-                               "table", table_str, NULL };
-        for (int v6 = 0; v6 <= 1; v6++) {
-            int ret = run_ip(v6, tail, output, sizeof(output));
-            if (ret != 0 && strstr(output, "can't find device")) {
-                LOG_WARN("Interface %s not in kernel routing stack (%s), using blackhole",
-                         iface_name, v6 ? "IPv6" : "IPv4");
-                add_blackhole(table_id, v6);
-            }
-        }
+    if (active)
         LOG_INFO("Normal routing restored for interface %s (table %d)", iface_name, table_id);
-    } else {
-        for (int v6 = 0; v6 <= 1; v6++)
-            add_blackhole(table_id, v6);
+    else
         LOG_INFO("Blackhole route activated for interface %s (table %d)", iface_name, table_id);
-    }
 
     return 0;
 }
@@ -315,7 +301,7 @@ int drm_handle_state_changes(direct_route_manager_t *drm,
 
         if (old_state && strcmp(old_state, new_state) != 0) {
             LOG_INFO("Interface %s state changed: %s -> %s", name, old_state, new_state);
-            drm_update_route_on_state_change(drm, name, drm->routes[i].table_id, new_state);
+            drm_update_route_on_state_change(name, drm->routes[i].table_id, new_state);
         }
     }
     return 0;
@@ -326,7 +312,7 @@ int drm_cleanup_all_routes(direct_route_manager_t *drm) {
         interface_route_t *r = &drm->routes[i];
         for (int v6 = 0; v6 <= 1; v6++)
             drm_delete_ip_rule(r->fwmark, r->table_id, v6);
-        drm_flush_routing_table(drm, r->table_id);
+        drm_flush_routing_table(r->table_id);
     }
     return 0;
 }

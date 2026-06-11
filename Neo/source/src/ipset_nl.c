@@ -335,13 +335,11 @@ int ipset_add_batch(ipset_manager_t *mgr, const char *set_name,
                     int with_timeout, int *new_count, int *new_indices) {
     if (count == 0) return 0;
 
-    uint32_t idx = fnv1a_hash(set_name, strlen(set_name)) & 0xFF;
-    int has_timeout = mgr->set_has_timeout[idx];
-    uint32_t timeout_val = mgr->timeout_value[idx];
+    int has_timeout = mgr->default_timeout > 0;
 
     uint8_t timeout_bytes[4] = {0};
     if (has_timeout && with_timeout) {
-        put_u32_network(timeout_bytes, timeout_val);
+        put_u32_network(timeout_bytes, mgr->default_timeout);
     }
 
     uint16_t excl_flag = with_timeout ? NLM_F_EXCL : 0;
@@ -453,11 +451,4 @@ static void ipset_add_to_cache(ipset_manager_t *mgr, const char *name) {
         mgr->set_count++;
         LOG_DEBUG("AddToCache: added %s to cache", name);
     }
-}
-
-void ipset_cache_timeout_for_set(ipset_manager_t *mgr, const char *name,
-                                 int has_timeout, uint32_t timeout_val) {
-    uint32_t idx = fnv1a_hash(name, strlen(name)) & 0xFF;
-    mgr->set_has_timeout[idx] = has_timeout;
-    mgr->timeout_value[idx] = timeout_val;
 }

@@ -5,7 +5,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <ctype.h>
 #include <errno.h>
 #include <unistd.h>
 #include <arpa/inet.h>
@@ -48,46 +47,57 @@ static int read_varint_stream(FILE *f, uint64_t *out_val) {
     }
 }
 
+typedef struct {
+    uint32_t field;
+    int wire_type;
+    uint64_t varint;
+    const uint8_t *body;
+    int body_len;
+} pb_field_t;
+
+static int pb_next_field(const uint8_t *data, int len, int *pos, pb_field_t *out) {
+    if (*pos >= len) return 0;
+
+    uint8_t tag = data[(*pos)++];
+    out->field = tag >> 3;
+    out->wire_type = tag & 0x07;
+
+    if (out->wire_type == 0) {
+        int br = read_varint(data, len, *pos, &out->varint);
+        if (br < 0) return -1;
+        *pos += br;
+        return 1;
+    }
+    if (out->wire_type == 2) {
+        uint64_t flen;
+        int br = read_varint(data, len, *pos, &flen);
+        if (br < 0) return -1;
+        *pos += br;
+        if (*pos + (int)flen > len) return -1;
+        out->body = data + *pos;
+        out->body_len = (int)flen;
+        *pos += (int)flen;
+        return 1;
+    }
+    return -1;
+}
+
 static int parse_cidr_body(const uint8_t *data, int len, geoip_entry_t *entry) {
     memset(entry, 0, sizeof(*entry));
     int pos = 0;
+    int rc;
+    pb_field_t f;
 
-    while (pos < len) {
-        uint8_t tag = data[pos++];
-
-        if (tag == 0x0A) {
-            uint64_t ip_len;
-            int br = read_varint(data, len, pos, &ip_len);
-            if (br < 0) return -1;
-            pos += br;
-            if (ip_len != 4 && ip_len != 16) return -1;
-            if (pos + (int)ip_len > len) return -1;
-            memcpy(entry->ip, data + pos, ip_len);
-            entry->ip_len = (uint8_t)ip_len;
-            pos += ip_len;
-        } else if (tag == 0x10) {
-            uint64_t prefix;
-            int br = read_varint(data, len, pos, &prefix);
-            if (br < 0) return -1;
-            pos += br;
-            entry->prefix = (uint32_t)prefix;
-        } else {
-            int wire_type = tag & 0x07;
-            if (wire_type == 0) {
-                uint64_t dummy;
-                int br = read_varint(data, len, pos, &dummy);
-                if (br < 0) return -1;
-                pos += br;
-            } else if (wire_type == 2) {
-                uint64_t flen;
-                int br = read_varint(data, len, pos, &flen);
-                if (br < 0) return -1;
-                pos += br + (int)flen;
-            } else {
-                return -1;
-            }
+    while ((rc = pb_next_field(data, len, &pos, &f)) == 1) {
+        if (f.field == 1 && f.wire_type == 2) {
+            if (f.body_len != 4 && f.body_len != 16) return -1;
+            memcpy(entry->ip, f.body, f.body_len);
+            entry->ip_len = (uint8_t)f.body_len;
+        } else if (f.field == 2 && f.wire_type == 0) {
+            entry->prefix = (uint32_t)f.varint;
         }
     }
+    if (rc < 0) return -1;
 
     int all_zero = 1;
     for (int i = 0; i < 16; i++) {
@@ -98,86 +108,18 @@ static int parse_cidr_body(const uint8_t *data, int len, geoip_entry_t *entry) {
     return 0;
 }
 
-static int parse_geoip_body(const uint8_t *data, int len,
-                            geoip_entry_t **entries, int *count, int *capacity) {
+typedef void (*geoip_cidr_fn)(const geoip_entry_t *entry, void *ctx);
+
+static void for_each_geoip_cidr(const uint8_t *data, int len,
+                                geoip_cidr_fn fn, void *ctx) {
     int pos = 0;
+    pb_field_t f;
 
-    while (pos < len) {
-        uint8_t tag = data[pos++];
-
-        if (tag == 0x12) {
-            uint64_t cidr_len;
-            int br = read_varint(data, len, pos, &cidr_len);
-            if (br < 0) break;
-            pos += br;
-            if (pos + (int)cidr_len > len) break;
-
-            geoip_entry_t entry;
-            if (parse_cidr_body(data + pos, (int)cidr_len, &entry) == 0) {
-                if (*count >= *capacity) {
-                    int new_cap = *capacity * 2;
-                    geoip_entry_t *tmp = realloc(*entries, new_cap * sizeof(geoip_entry_t));
-                    if (!tmp) break;
-                    *entries = tmp;
-                    *capacity = new_cap;
-                }
-                (*entries)[(*count)++] = entry;
-            }
-            pos += (int)cidr_len;
-        } else {
-            int wire_type = tag & 0x07;
-            if (wire_type == 0) {
-                uint64_t dummy;
-                int br = read_varint(data, len, pos, &dummy);
-                if (br < 0) break;
-                pos += br;
-            } else if (wire_type == 2) {
-                uint64_t flen;
-                int br = read_varint(data, len, pos, &flen);
-                if (br < 0) break;
-                pos += br + (int)flen;
-                if (pos > len) break;
-            } else {
-                break;
-            }
-        }
-    }
-    return 0;
-}
-
-static void count_geoip_body(const uint8_t *data, int len, int *ipv4, int *ipv6) {
-    int pos = 0;
-    while (pos < len) {
-        uint8_t tag = data[pos++];
-        if (tag == 0x12) {
-            uint64_t cidr_len;
-            int br = read_varint(data, len, pos, &cidr_len);
-            if (br < 0) break;
-            pos += br;
-            if (pos + (int)cidr_len > len) break;
-            geoip_entry_t entry;
-            if (parse_cidr_body(data + pos, (int)cidr_len, &entry) == 0) {
-                if (entry.ip_len == 4) (*ipv4)++;
-                else if (entry.ip_len == 16) (*ipv6)++;
-            }
-            pos += (int)cidr_len;
-        } else {
-            int wire_type = tag & 0x07;
-            if (wire_type == 0) {
-                uint64_t dummy;
-                int br = read_varint(data, len, pos, &dummy);
-                if (br < 0) break;
-                pos += br;
-            } else if (wire_type == 2) {
-                uint64_t flen;
-                int br = read_varint(data, len, pos, &flen);
-                if (br < 0) break;
-                pos += br + (int)flen;
-                if (pos > len) break;
-            } else {
-                break;
-            }
-        }
+    while (pb_next_field(data, len, &pos, &f) == 1) {
+        if (f.field != 2 || f.wire_type != 2) continue;
+        geoip_entry_t entry;
+        if (parse_cidr_body(f.body, f.body_len, &entry) == 0)
+            fn(&entry, ctx);
     }
 }
 
@@ -185,103 +127,73 @@ static int parse_geosite_domain(const uint8_t *data, int len, geosite_domain_t *
     domain->type = 0;
     domain->value = NULL;
     int pos = 0;
+    int rc;
+    pb_field_t f;
 
-    while (pos < len) {
-        uint8_t tag = data[pos++];
-
-        if (tag == 0x08) {
-            uint64_t type_val;
-            int br = read_varint(data, len, pos, &type_val);
-            if (br < 0) return -1;
-            pos += br;
-            domain->type = (uint32_t)type_val;
-        } else if (tag == 0x12) {
-            uint64_t val_len;
-            int br = read_varint(data, len, pos, &val_len);
-            if (br < 0) return -1;
-            pos += br;
-            if (pos + (int)val_len > len) return -1;
-            domain->value = malloc(val_len + 1);
-            memcpy(domain->value, data + pos, val_len);
-            domain->value[val_len] = 0;
-            pos += (int)val_len;
-        } else {
-            int wire_type = tag & 0x07;
-            if (wire_type == 0) {
-                uint64_t dummy;
-                int br = read_varint(data, len, pos, &dummy);
-                if (br < 0) return -1;
-                pos += br;
-            } else if (wire_type == 2) {
-                uint64_t flen;
-                int br = read_varint(data, len, pos, &flen);
-                if (br < 0) return -1;
-                pos += br + (int)flen;
-                if (pos > len) return -1;
-            } else {
-                return -1;
-            }
+    while ((rc = pb_next_field(data, len, &pos, &f)) == 1) {
+        if (f.field == 1 && f.wire_type == 0) {
+            domain->type = (uint32_t)f.varint;
+        } else if (f.field == 2 && f.wire_type == 2 && !domain->value) {
+            domain->value = malloc(f.body_len + 1);
+            if (!domain->value) return -1;
+            memcpy(domain->value, f.body, f.body_len);
+            domain->value[f.body_len] = 0;
         }
     }
-    return (domain->value != NULL) ? 0 : -1;
+    if (rc < 0 || !domain->value) {
+        free(domain->value);
+        domain->value = NULL;
+        return -1;
+    }
+    return 0;
 }
 
 static int parse_geosite_body(const uint8_t *data, int len,
                               geosite_domain_t **domains, int *count, int *capacity) {
     int pos = 0;
+    pb_field_t f;
 
-    while (pos < len) {
-        uint8_t tag = data[pos++];
+    while (pb_next_field(data, len, &pos, &f) == 1) {
+        if (f.field != 2 || f.wire_type != 2) continue;
 
-        if (tag == 0x12) {
-            uint64_t domain_len;
-            int br = read_varint(data, len, pos, &domain_len);
-            if (br < 0) break;
-            pos += br;
-            if (pos + (int)domain_len > len) break;
+        geosite_domain_t entry;
+        if (parse_geosite_domain(f.body, f.body_len, &entry) != 0) continue;
 
-            geosite_domain_t entry;
-            if (parse_geosite_domain(data + pos, (int)domain_len, &entry) == 0) {
-                if (*count >= *capacity) {
-                    int new_cap = *capacity * 2;
-                    geosite_domain_t *tmp = realloc(*domains, new_cap * sizeof(geosite_domain_t));
-                    if (!tmp) {
-                        free(entry.value);
-                        break;
-                    }
-                    *domains = tmp;
-                    *capacity = new_cap;
-                }
-                (*domains)[(*count)++] = entry;
-            }
-            pos += (int)domain_len;
-        } else {
-            int wire_type = tag & 0x07;
-            if (wire_type == 0) {
-                uint64_t dummy;
-                int br = read_varint(data, len, pos, &dummy);
-                if (br < 0) break;
-                pos += br;
-            } else if (wire_type == 2) {
-                uint64_t flen;
-                int br = read_varint(data, len, pos, &flen);
-                if (br < 0) break;
-                pos += br + (int)flen;
-                if (pos > len) break;
-            } else {
+        if (*count >= *capacity) {
+            int new_cap = *capacity * 2;
+            geosite_domain_t *tmp = realloc(*domains, new_cap * sizeof(geosite_domain_t));
+            if (!tmp) {
+                free(entry.value);
                 break;
             }
+            *domains = tmp;
+            *capacity = new_cap;
         }
+        (*domains)[(*count)++] = entry;
     }
     return 0;
+}
+
+static void upcase_inplace(char *s) {
+    for (; *s; s++)
+        if (*s >= 'a' && *s <= 'z') *s -= 32;
 }
 
 static void upcase_buf(char *dst, size_t dst_size, const char *src) {
     size_t n = 0;
     while (n + 1 < dst_size && src[n]) { dst[n] = src[n]; n++; }
     dst[n] = 0;
-    for (char *p = dst; *p; p++)
-        if (*p >= 'a' && *p <= 'z') *p -= 32;
+    upcase_inplace(dst);
+}
+
+static void extract_geoip_country(const char *entry, char *out, size_t out_size) {
+    const char *src = entry + 6;
+    while (*src == ' ') src++;
+    size_t n = strlen(src);
+    while (n > 0 && src[n - 1] == ' ') n--;
+    if (n >= out_size) n = out_size - 1;
+    memcpy(out, src, n);
+    out[n] = 0;
 }
 
 typedef void (*dat_body_visitor_t)(const uint8_t *body, int body_len, void *ctx);
@@ -315,8 +227,7 @@ static int scan_dat_file(const char *file_path, const char *target_upper,
         char code[64] = {0};
         size_t clen = code_len < sizeof(code) - 1 ? code_len : sizeof(code) - 1;
         memcpy(code, body + code_start, clen);
-        for (char *p = code; *p; p++)
-            if (*p >= 'a' && *p <= 'z') *p -= 32;
+        upcase_inplace(code);
 
         if (strcmp(code, target_upper) == 0) {
             int data_pos = code_start + (int)code_len;
@@ -334,9 +245,14 @@ typedef struct {
     int *ipv6;
 } count_ctx_t;
 
-static void count_geoip_visitor(const uint8_t *body, int len, void *ctx) {
+static void count_geoip_entry(const geoip_entry_t *entry, void *ctx) {
     count_ctx_t *c = (count_ctx_t *)ctx;
-    count_geoip_body(body, len, c->ipv4, c->ipv6);
+    if (entry->ip_len == 4) (*c->ipv4)++;
+    else if (entry->ip_len == 16) (*c->ipv6)++;
+}
+
+static void count_geoip_visitor(const uint8_t *body, int len, void *ctx) {
+    for_each_geoip_cidr(body, len, count_geoip_entry, ctx);
 }
 
 static void count_geoip_cidrs_all_files(
@@ -360,9 +276,20 @@ typedef struct {
     int *capacity;
 } extract_geoip_ctx_t;
 
-static void extract_geoip_visitor(const uint8_t *body, int len, void *ctx) {
+static void append_geoip_entry(const geoip_entry_t *entry, void *ctx) {
     extract_geoip_ctx_t *c = (extract_geoip_ctx_t *)ctx;
-    parse_geoip_body(body, len, c->entries, c->count, c->capacity);
+    if (*c->count >= *c->capacity) {
+        int new_cap = *c->capacity * 2;
+        geoip_entry_t *tmp = realloc(*c->entries, new_cap * sizeof(geoip_entry_t));
+        if (!tmp) return;
+        *c->entries = tmp;
+        *c->capacity = new_cap;
+    }
+    (*c->entries)[(*c->count)++] = *entry;
+}
+
+static void extract_geoip_visitor(const uint8_t *body, int len, void *ctx) {
+    for_each_geoip_cidr(body, len, append_geoip_entry, ctx);
 }
 
 static int extract_geoip_cidrs(const char *file_path, const char *country_code,
@@ -419,7 +346,11 @@ static int compare_dots(const void *a, const void *b) {
 
 static int deduplicate_domains(const geosite_domain_t *domains, int count,
                                geosite_domain_t **output, int *out_count) {
+    *output = NULL;
+    *out_count = 0;
+
     dedup_entry_t *entries = malloc(count * sizeof(dedup_entry_t));
+    if (!entries) return -1;
     int entry_count = 0;
 
     for (int i = 0; i < count; i++) {
@@ -434,20 +365,20 @@ static int deduplicate_domains(const geosite_domain_t *domains, int count,
 
     if (entry_count == 0) {
         free(entries);
-        *output = NULL;
-        *out_count = 0;
         return 0;
     }
 
     qsort(entries, entry_count, sizeof(dedup_entry_t), compare_dots);
 
     domain_hashtable_t *accepted = ht_create();
-
     *output = malloc(entry_count * sizeof(geosite_domain_t));
-    *out_count = 0;
-
-    domain_entry_t dummy_entry;
-    memset(&dummy_entry, 0, sizeof(dummy_entry));
+    if (!accepted || !*output) {
+        ht_destroy(accepted);
+        free(*output);
+        *output = NULL;
+        free(entries);
+        return -1;
+    }
 
     for (int i = 0; i < entry_count; i++) {
         const char *val = domains[entries[i].idx].value;
@@ -519,10 +450,8 @@ int parse_geosite_rules(const char *watchlist_path,
                     int copy_len = tlen < MAX_TAG_LEN - 1 ? tlen : MAX_TAG_LEN - 1;
                     memcpy(rules[count].tag, tag_str, copy_len);
                     rules[count].tag[copy_len] = 0;
-                    for (char *p = rules[count].tag; *p; p++) {
-                        if (*p >= 'a' && *p <= 'z') *p -= 32;
-                    }
-                    strncpy(rules[count].policy_name, policy, MAX_POLICY_NAME - 1);
+                    upcase_inplace(rules[count].tag);
+                    snprintf(rules[count].policy_name, MAX_POLICY_NAME, "%s", policy);
                     count++;
                 }
             }
@@ -659,6 +588,69 @@ static int parse_cidr_str(const char *str, parsed_cidr_t *out) {
     return 0;
 }
 
+typedef enum {
+    CIDR_LINE_BLANK,
+    CIDR_LINE_DISABLED,
+    CIDR_LINE_HEADER,
+    CIDR_LINE_ENTRY,
+} cidr_line_kind_t;
+
+static cidr_line_kind_t cidr_classify(char *line, char **payload) {
+    char *t = line;
+    while (*t == ' ' || *t == '\t') t++;
+    *payload = t;
+    if (t[0] == '\0' || strncmp(t, "##", 2) == 0) return CIDR_LINE_BLANK;
+    if (strncmp(t, "#/", 2) == 0) { *payload = t + 2; return CIDR_LINE_DISABLED; }
+    if (t[0] == '/') { *payload = t + 1; return CIDR_LINE_HEADER; }
+    return CIDR_LINE_ENTRY;
+}
+
+static void copy_block_name(char *dst, size_t dst_size, const char *src) {
+    while (*src == ' ') src++;
+    size_t n = strlen(src);
+    while (n > 0 && (src[n - 1] == ' ' || src[n - 1] == '\t')) n--;
+    if (n >= dst_size) n = dst_size - 1;
+    memcpy(dst, src, n);
+    dst[n] = 0;
+}
+
+int parse_cidr_policy_headers(const char *path, char names[][64], int max_names) {
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        LOG_ERROR("Cannot open CIDR file: %s", path);
+        return 0;
+    }
+
+    int count = 0;
+    char *line = NULL;
+    size_t cap = 0;
+    while (getline(&line, &cap, f) != -1) {
+        line[strcspn(line, "\n\r")] = 0;
+        char *payload;
+        if (cidr_classify(line, &payload) != CIDR_LINE_HEADER) continue;
+
+        char name[64];
+        copy_block_name(name, sizeof(name), payload);
+        if (!name[0]) continue;
+
+        int found = 0;
+        for (int j = 0; j < count; j++) {
+            if (strcmp(names[j], name) == 0) {
+                found = 1;
+                break;
+            }
+        }
+        if (!found && count < max_names) {
+            memcpy(names[count], name, sizeof(name));
+            count++;
+        }
+    }
+
+    free(line);
+    fclose(f);
+    return count;
+}
+
 typedef struct {
     char tag[MAX_TAG_LEN];
     int  ipv4;
@@ -671,28 +663,27 @@ typedef struct {
     int  warned;
 } ipset_usage_t;
 
-/* Open-addressed FNV-1a name → array index for batches[] and usage[].
- * Replaces O(n) linear scan; load factor stays well under 50% since
- * MAX_POLICY_ORDER * 2 = 128 and SLOT_COUNT = 256. */
 #define NAME_INDEX_SLOTS 256
 
 typedef struct {
-    int      slot_idx[NAME_INDEX_SLOTS];   /* -1 = empty */
+    int      slot_idx[NAME_INDEX_SLOTS];
     uint32_t slot_hash[NAME_INDEX_SLOTS];
 } name_index_t;
+
+typedef const char *(*name_at_fn)(const void *base, int idx);
 
 static void name_index_init(name_index_t *ni) {
     for (int i = 0; i < NAME_INDEX_SLOTS; i++) ni->slot_idx[i] = -1;
 }
 
-static int usage_index_lookup(const name_index_t *ni, const ipset_usage_t *usage,
-                               uint32_t hash, const char *name) {
+static int name_index_lookup(const name_index_t *ni, uint32_t hash, const char *name,
+                             const void *base, name_at_fn name_at) {
     uint32_t mask = NAME_INDEX_SLOTS - 1;
     for (uint32_t probe = 0; probe < NAME_INDEX_SLOTS; probe++) {
         uint32_t slot = (hash + probe) & mask;
         if (ni->slot_idx[slot] < 0) return -1;
         if (ni->slot_hash[slot] == hash &&
-            strcmp(usage[ni->slot_idx[slot]].set_name, name) == 0)
+            strcmp(name_at(base, ni->slot_idx[slot]), name) == 0)
             return ni->slot_idx[slot];
     }
     return -1;
@@ -710,10 +701,14 @@ static void name_index_insert(name_index_t *ni, uint32_t hash, int idx) {
     }
 }
 
+static const char *usage_name_at(const void *base, int idx) {
+    return ((const ipset_usage_t *)base)[idx].set_name;
+}
+
 static int usage_find_or_add(ipset_usage_t *usage, int *n, name_index_t *idx,
                               const char *name) {
     uint32_t hash = fnv1a_hash(name, strlen(name));
-    int existing = usage_index_lookup(idx, usage, hash, name);
+    int existing = name_index_lookup(idx, hash, name, usage, usage_name_at);
     if (existing >= 0) return existing;
     if (*n >= MAX_POLICY_ORDER * 2) return -1;
     strncpy(usage[*n].set_name, name, 63);
@@ -725,7 +720,7 @@ static int usage_find_or_add(ipset_usage_t *usage, int *n, name_index_t *idx,
     return new_idx;
 }
 
-#define CIDR_MIGRATE_MAX_LINES  16384
+#define CIDR_MIGRATE_HEADROOM   5000
 #define CIDR_MIGRATE_MAX_BLOCKS 512
 
 typedef struct {
@@ -749,13 +744,21 @@ static int cidrfile_migrate_oversized(
         return -1;
     }
 
-    cidr_line_t *lines = malloc(CIDR_MIGRATE_MAX_LINES * sizeof(cidr_line_t));
+    int line_cap = 4096;
+    cidr_line_t *lines = malloc(line_cap * sizeof(cidr_line_t));
     if (!lines) { fclose(f); return -1; }
 
     int line_count = 0;
     char *buf = NULL;
     size_t cap = 0;
-    while (getline(&buf, &cap, f) != -1 && line_count < CIDR_MIGRATE_MAX_LINES) {
+    while (getline(&buf, &cap, f) != -1) {
+        if (line_count >= line_cap) {
+            int new_cap = line_cap * 2;
+            cidr_line_t *tmp = realloc(lines, new_cap * sizeof(cidr_line_t));
+            if (!tmp) { free(buf); free_cidr_lines(lines, line_count); fclose(f); return -1; }
+            lines = tmp;
+            line_cap = new_cap;
+        }
         buf[strcspn(buf, "\n\r")] = 0;
         lines[line_count].text = strdup(buf);
         if (!lines[line_count].text) { free(buf); free_cidr_lines(lines, line_count); fclose(f); return -1; }
@@ -776,20 +779,15 @@ static int cidrfile_migrate_oversized(
     int in_active = 0;
 
     for (int i = 0; i < line_count; i++) {
-        char *t = lines[i].text;
-        while (*t == ' ' || *t == '\t') t++;
+        char *payload;
+        cidr_line_kind_t kind = cidr_classify(lines[i].text, &payload);
 
-        if (t[0] == '\0' || strncmp(t, "##", 2) == 0) {
+        if (kind == CIDR_LINE_BLANK || kind == CIDR_LINE_DISABLED) {
             current_block = -1;
             in_active = 0;
             continue;
         }
-        if (strncmp(t, "#/", 2) == 0) {
-            current_block = -1;
-            in_active = 0;
-            continue;
-        }
-        if (t[0] == '/') {
+        if (kind == CIDR_LINE_HEADER) {
             if (next_block >= CIDR_MIGRATE_MAX_BLOCKS) { free_cidr_lines(lines, line_count); return -1; }
             current_block = next_block++;
             in_active = 1;
@@ -801,17 +799,10 @@ static int cidrfile_migrate_oversized(
 
         lines[i].block_id = current_block;
 
-        if (strncmp(t, "geoip:", 6) == 0) {
-            char *country = t + 6;
-            while (*country == ' ') country++;
-            int clen = strlen(country);
-            while (clen > 0 && country[clen - 1] == ' ') clen--;
-
-            char tag_upper[MAX_TAG_LEN] = {0};
-            int tcopy = clen < MAX_TAG_LEN - 1 ? clen : MAX_TAG_LEN - 1;
-            memcpy(tag_upper, country, tcopy);
-            for (char *p = tag_upper; *p; p++)
-                if (*p >= 'a' && *p <= 'z') *p -= 32;
+        if (strncmp(payload, "geoip:", 6) == 0) {
+            char tag_upper[MAX_TAG_LEN];
+            extract_geoip_country(payload, tag_upper, sizeof(tag_upper));
+            upcase_inplace(tag_upper);
 
             int is_over = 0;
             for (int o = 0; o < oversized_count; o++) {
@@ -830,9 +821,8 @@ static int cidrfile_migrate_oversized(
         if (block_active[bid] > 0 || block_header[bid] < 0) continue;
         lines[block_header[bid]].keep = 0;
         for (int i = block_header[bid] - 1; i >= 0; i--) {
-            char *t = lines[i].text;
-            while (*t == ' ' || *t == '\t') t++;
-            if (t[0] == '\0' || strncmp(t, "##", 2) == 0) {
+            char *payload;
+            if (cidr_classify(lines[i].text, &payload) == CIDR_LINE_BLANK) {
                 lines[i].keep = 0;
             } else {
                 break;
@@ -867,9 +857,9 @@ static int cidrfile_migrate_oversized(
             if (strcmp(written[w], oversized[o].tag) == 0) { already = 1; break; }
         }
         if (already || written_count >= 256) continue;
-        strncpy(written[written_count++], oversized[o].tag, MAX_TAG_LEN - 1);
-        char lower[MAX_TAG_LEN] = {0};
-        strncpy(lower, oversized[o].tag, MAX_TAG_LEN - 1);
+        memcpy(written[written_count++], oversized[o].tag, MAX_TAG_LEN);
+        char lower[MAX_TAG_LEN];
+        memcpy(lower, oversized[o].tag, MAX_TAG_LEN);
         for (char *p = lower; *p; p++)
             if (*p >= 'A' && *p <= 'Z') *p += 32;
         fprintf(out, "geoip:%s\n", lower);
@@ -892,10 +882,6 @@ typedef struct {
 
 typedef void (*cidr_entry_fn)(const cidr_block_t *blk, const char *entry, void *ctx);
 
-/* Generic block-aware scanner for CIDRfile. Walks lines, maintains the
- * /Name, ##, #/Name, empty-line state machine, and invokes on_entry for every
- * content line inside an active block (one whose name resolves to at least
- * one existing ipset). When verbose=1, emits LOG_DEBUG block-boundary lines. */
 static int scan_cidrfile_blocks(const char *path, ipset_manager_t *mgr,
                                  cidr_entry_fn on_entry, void *ctx, int verbose) {
     FILE *f = fopen(path, "r");
@@ -910,39 +896,24 @@ static int scan_cidrfile_blocks(const char *path, ipset_manager_t *mgr,
 
     while (getline(&line, &cap, f) != -1) {
         line[strcspn(line, "\n\r")] = 0;
-        char *t = line;
-        while (*t == ' ' || *t == '\t') t++;
+        char *payload;
+        cidr_line_kind_t kind = cidr_classify(line, &payload);
 
-        if (t[0] == '\0' || strncmp(t, "##", 2) == 0) {
+        if (kind == CIDR_LINE_BLANK || kind == CIDR_LINE_DISABLED) {
             if (verbose && in_block && blk.name[0])
                 LOG_DEBUG("End of CIDR block: %s", blk.name);
+            if (verbose && kind == CIDR_LINE_DISABLED)
+                LOG_DEBUG("Disabled CIDR block: %s (skipping)", payload);
             blk.name[0] = 0;
             blk.has_v4 = blk.has_v6 = 0;
             is_active = 0;
-            in_block = 0;
+            in_block = (kind == CIDR_LINE_DISABLED);
             continue;
         }
-        if (strncmp(t, "#/", 2) == 0) {
+        if (kind == CIDR_LINE_HEADER) {
             if (verbose && in_block && blk.name[0])
                 LOG_DEBUG("End of CIDR block: %s", blk.name);
-            if (verbose)
-                LOG_DEBUG("Disabled CIDR block: %s (skipping)", t + 2);
-            blk.name[0] = 0;
-            blk.has_v4 = blk.has_v6 = 0;
-            is_active = 0;
-            in_block = 1;
-            continue;
-        }
-        if (t[0] == '/') {
-            if (verbose && in_block && blk.name[0])
-                LOG_DEBUG("End of CIDR block: %s", blk.name);
-            char *name = t + 1;
-            while (*name == ' ') name++;
-            strncpy(blk.name, name, sizeof(blk.name) - 1);
-            blk.name[sizeof(blk.name) - 1] = 0;
-            int nlen = strlen(blk.name);
-            while (nlen > 0 && (blk.name[nlen - 1] == ' ' || blk.name[nlen - 1] == '\t'))
-                blk.name[--nlen] = 0;
+            copy_block_name(blk.name, sizeof(blk.name), payload);
             char v6n[64];
             snprintf(v6n, sizeof(v6n), "%.60sv6", blk.name);
             blk.has_v4 = ipset_set_exists(mgr, blk.name);
@@ -960,7 +931,7 @@ static int scan_cidrfile_blocks(const char *path, ipset_manager_t *mgr,
         }
 
         if (!is_active || !blk.name[0]) continue;
-        if (on_entry) on_entry(&blk, t, ctx);
+        if (on_entry) on_entry(&blk, payload, ctx);
     }
     free(line);
     fclose(f);
@@ -973,6 +944,10 @@ typedef struct {
     int                tag_cache_max;
     const char (*geoip_files)[512];
     int                geoip_count;
+    uint32_t           migrate_threshold;
+    geoip_tag_count_t *oversized;
+    int               *oversized_count;
+    int                oversized_max;
 } phase1_ctx_t;
 
 static void phase1_on_entry(const cidr_block_t *blk, const char *entry, void *ctx) {
@@ -980,16 +955,9 @@ static void phase1_on_entry(const cidr_block_t *blk, const char *entry, void *ct
     if (strncmp(entry, "geoip:", 6) != 0) return;
     phase1_ctx_t *cx = (phase1_ctx_t *)ctx;
 
-    const char *country = entry + 6;
-    while (*country == ' ') country++;
-    int clen = strlen(country);
-    while (clen > 0 && country[clen - 1] == ' ') clen--;
-
-    char tag_upper[MAX_TAG_LEN] = {0};
-    int tcopy = clen < MAX_TAG_LEN - 1 ? clen : MAX_TAG_LEN - 1;
-    memcpy(tag_upper, country, tcopy);
-    for (char *p = tag_upper; *p; p++)
-        if (*p >= 'a' && *p <= 'z') *p -= 32;
+    char tag_upper[MAX_TAG_LEN];
+    extract_geoip_country(entry, tag_upper, sizeof(tag_upper));
+    upcase_inplace(tag_upper);
 
     for (int k = 0; k < *cx->tag_cache_count; k++) {
         if (strcmp(cx->tag_cache[k].tag, tag_upper) == 0) return;
@@ -1003,6 +971,15 @@ static void phase1_on_entry(const cidr_block_t *blk, const char *entry, void *ct
     tc->ipv6 = 0;
     count_geoip_cidrs_all_files(cx->geoip_files, cx->geoip_count, tag_upper,
                                 &tc->ipv4, &tc->ipv6);
+
+    if ((uint32_t)tc->ipv4 > cx->migrate_threshold ||
+        (uint32_t)tc->ipv6 > cx->migrate_threshold) {
+        LOG_WARN("geoip:%s: %d IPv4 + %d IPv6 CIDR exceeds migration threshold %u, "
+                 "moving to disabled block",
+                 tc->tag, tc->ipv4, tc->ipv6, cx->migrate_threshold);
+        if (*cx->oversized_count < cx->oversized_max)
+            cx->oversized[(*cx->oversized_count)++] = *tc;
+    }
 }
 
 typedef struct {
@@ -1033,23 +1010,14 @@ typedef struct {
     name_index_t  *usage_index;
 } phase2_ctx_t;
 
-static int batches_index_lookup(const name_index_t *ni, const batch_t *batches,
-                                 uint32_t hash, const char *name) {
-    uint32_t mask = NAME_INDEX_SLOTS - 1;
-    for (uint32_t probe = 0; probe < NAME_INDEX_SLOTS; probe++) {
-        uint32_t slot = (hash + probe) & mask;
-        if (ni->slot_idx[slot] < 0) return -1;
-        if (ni->slot_hash[slot] == hash &&
-            strcmp(batches[ni->slot_idx[slot]].set_name, name) == 0)
-            return ni->slot_idx[slot];
-    }
-    return -1;
+static const char *batch_name_at(const void *base, int idx) {
+    return ((const batch_t *)base)[idx].set_name;
 }
 
 static int batch_find_or_add(batch_t *batches, int *count, int max,
                               name_index_t *idx, const char *set_name, int initial_cap) {
     uint32_t hash = fnv1a_hash(set_name, strlen(set_name));
-    int existing = batches_index_lookup(idx, batches, hash, set_name);
+    int existing = name_index_lookup(idx, hash, set_name, batches, batch_name_at);
     if (existing >= 0) return existing;
     if (*count >= max) return -1;
     int bi = (*count)++;
@@ -1083,24 +1051,16 @@ static void phase2_on_entry(const cidr_block_t *blk, const char *entry, void *ct
     const char *cur = blk->name;
 
     if (strncmp(entry, "geoip:", 6) == 0) {
-        char country[MAX_TAG_LEN] = {0};
-        const char *src = entry + 6;
-        while (*src == ' ') src++;
-        int clen = strlen(src);
-        while (clen > 0 && src[clen - 1] == ' ') clen--;
-        int ccopy = clen < MAX_TAG_LEN - 1 ? clen : MAX_TAG_LEN - 1;
-        memcpy(country, src, ccopy);
-        country[ccopy] = 0;
+        char country[MAX_TAG_LEN];
+        extract_geoip_country(entry, country, sizeof(country));
 
         if (cx->geoip_count == 0 || !cx->geoip_files) {
             LOG_WARN("GeoIP directive 'geoip:%s' found but GeoIPFile not configured", country);
             return;
         }
 
-        char tag_upper[MAX_TAG_LEN] = {0};
-        strncpy(tag_upper, country, MAX_TAG_LEN - 1);
-        for (char *p = tag_upper; *p; p++)
-            if (*p >= 'a' && *p <= 'z') *p -= 32;
+        char tag_upper[MAX_TAG_LEN];
+        upcase_buf(tag_upper, sizeof(tag_upper), country);
 
         for (int o = 0; o < cx->oversized_count; o++) {
             if (strcmp(cx->oversized[o].tag, tag_upper) == 0) return;
@@ -1220,12 +1180,12 @@ static void phase2_on_entry(const cidr_block_t *blk, const char *entry, void *ct
 }
 
 int add_cidr_to_ipsets(ipset_manager_t *mgr, const char *cidr_path,
-                       const ipset_pair_t *pairs, int pair_count,
-                       int enable_timeout, int timeout,
                        const char (*geoip_files)[512], int geoip_count,
                        uint32_t maxelem)
 {
     uint32_t effective_limit = (maxelem > 0) ? maxelem : IPSET_DEFAULT_MAXELEM;
+    uint32_t migrate_threshold = effective_limit > CIDR_MIGRATE_HEADROOM
+                                 ? effective_limit - CIDR_MIGRATE_HEADROOM : 0;
 
     geoip_tag_count_t tag_cache[256];
     int tag_cache_count = 0;
@@ -1240,39 +1200,20 @@ int add_cidr_to_ipsets(ipset_manager_t *mgr, const char *cidr_path,
             .tag_cache_max = 256,
             .geoip_files = geoip_files,
             .geoip_count = geoip_count,
+            .migrate_threshold = migrate_threshold,
+            .oversized = oversized,
+            .oversized_count = &oversized_count,
+            .oversized_max = 256,
         };
-        if (scan_cidrfile_blocks(cidr_path, mgr, phase1_on_entry, &p1, 0) == 0) {
-            for (int k = 0; k < tag_cache_count; k++) {
-                if ((uint32_t)tag_cache[k].ipv4 > effective_limit ||
-                    (uint32_t)tag_cache[k].ipv6 > effective_limit) {
-                    LOG_WARN("geoip:%s: %d IPv4 + %d IPv6 CIDR exceeds limit %u, "
-                             "migrating to disabled block",
-                             tag_cache[k].tag, tag_cache[k].ipv4,
-                             tag_cache[k].ipv6, effective_limit);
-                    if (oversized_count < 256)
-                        oversized[oversized_count++] = tag_cache[k];
-                }
-            }
-
-            if (oversized_count > 0) {
-                if (cidrfile_migrate_oversized(cidr_path, oversized, oversized_count) == 0)
-                    LOG_INFO("CIDRfile updated: %d oversized tag(s) moved to disabled block",
-                             oversized_count);
-            }
+        if (scan_cidrfile_blocks(cidr_path, mgr, phase1_on_entry, &p1, 0) == 0 &&
+            oversized_count > 0) {
+            if (cidrfile_migrate_oversized(cidr_path, oversized, oversized_count) == 0)
+                LOG_INFO("CIDRfile updated: %d oversized tag(s) moved to disabled block",
+                         oversized_count);
         }
     }
 
     ipset_refresh_set_list(mgr);
-
-    if (enable_timeout && timeout > 0) {
-        uint32_t to = (uint32_t)timeout;
-        for (int i = 0; i < pair_count; i++) {
-            if (ipset_set_exists(mgr, pairs[i].ipv4))
-                ipset_cache_timeout_for_set(mgr, pairs[i].ipv4, 1, to);
-            if (ipset_set_exists(mgr, pairs[i].ipv6))
-                ipset_cache_timeout_for_set(mgr, pairs[i].ipv6, 1, to);
-        }
-    }
 
     batch_t batches[MAX_POLICY_ORDER * 2];
     int batch_count = 0;

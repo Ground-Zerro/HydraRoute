@@ -1,5 +1,5 @@
 PROJECT = hrneo
-VERSION = 3.11.0-1
+VERSION = 3.12.0-1
 
 CC_MIPSEL   = mipsel-linux-gnu-gcc
 CC_MIPS     = mips-linux-gnu-gcc
@@ -14,7 +14,7 @@ COMMON_CFLAGS = -Os -Wall -Wextra -Wno-unused-parameter \
                 -DVERSION=\"$(VERSION)\" \
                 -Iinclude
 
-COMMON_LDFLAGS = -Wl,--gc-sections -s
+COMMON_LDFLAGS = -Wl,--gc-sections -Wl,--build-id=sha1 -s
 
 CFLAGS_MIPSEL  = $(COMMON_CFLAGS) -march=mips32r2 -mtune=1004kc -EL \
                  -mno-check-zero-division -mno-shared -mno-plt
@@ -25,12 +25,12 @@ CFLAGS_AARCH64 = $(COMMON_CFLAGS) -march=armv8-a \
 CFLAGS_NATIVE  = $(COMMON_CFLAGS)
 
 LDFLAGS_STATIC  = $(COMMON_LDFLAGS) -static -static-libgcc
-LDFLAGS_AARCH64 = $(LDFLAGS_STATIC) -Wl,--strip-all -Wl,-z,norelro
+LDFLAGS_AARCH64 = $(LDFLAGS_STATIC) -Wl,-z,norelro
 LDFLAGS_DYNAMIC = $(COMMON_LDFLAGS)
 
 LIBS =
 
-SRCS = src/main.c src/util.c src/log.c src/config.c src/args.c src/params.c src/watchlist.c src/ipset_nl.c src/dns.c src/packet_capture.c src/iptables.c src/signal_handler.c src/rci.c src/conntrack.c src/geodat.c src/routing.c src/probe_tls.c src/probe_http.c src/bogon.c src/nfq_capture.c src/l7_dispatch.c src/l7_firewall.c src/tcp_reasm.c
+SRCS = src/main.c src/util.c src/log.c src/config.c src/args.c src/params.c src/watchlist.c src/ipset_nl.c src/dns.c src/packet_capture.c src/iptables.c src/signal_handler.c src/rci.c src/conntrack.c src/geodat.c src/routing.c src/probe_tls.c src/probe_http.c src/bogon.c src/nflog_capture.c src/l7_dispatch.c src/l7_firewall.c src/tcp_reasm.c
 
 .PHONY: all clean mipsel mips aarch64 native
 
