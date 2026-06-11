@@ -8,16 +8,9 @@
 
 ## Версии
 
-### Neo — актуальная версия
+### Neo
 
-DNS-based policy routing демон для Keenetic. Перехватывает DNS-ответы через NFLOG, добавляет IP в ipset через netlink, маркирует трафик в iptables.
-
-- Не требует отключения системного DNS-сервера
-- Прямая маршрутизация на сетевые интерфейсы (DirectRoute)
-- Неограниченное количество политик маршрутизации
-- GeoIP и GeoSite в формате v2ray/xray `.dat`
-- Веб-интерфейс управления (HRweb)
-- Полная поддержка IPv6
+Актуальная версия.
 
 [Подробная документация →](https://git.zerrolabs.org/Ground-Zerro/HydraRoute/tree/main/Neo)
 
@@ -41,10 +34,10 @@ DNS-based policy routing демон для Keenetic. Перехватывает 
 opkg update && opkg install curl && curl -Ls "https://git.zerrolabs.org/Ground-Zerro/release/pages/keenetic/install-neo.sh" | sh
 ```
 
-**Требования:** роутер Keenetic с прошивкой выше v4.3.6, установленный Entware, компонент «Xtables-addons для Netfilter».
+> **Требования:** роутер Keenetic с прошивкой выше v4.3.6, установленный Entware.
 
 ---
 
-## Поддержка
+## Поддержать автора
 
 [Boosty](https://boosty.to/ground_zerro)
