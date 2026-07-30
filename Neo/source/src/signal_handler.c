@@ -5,6 +5,7 @@
 #include <sys/timerfd.h>
 #include <unistd.h>
 #include <stdint.h>
+#include <time.h>
 
 int signal_mgr_init(signal_mgr_t *m) {
     m->sig_fd = -1;
@@ -43,13 +44,27 @@ void signal_mgr_close(signal_mgr_t *m) {
     if (m->sig_fd   >= 0) { close(m->sig_fd);   m->sig_fd   = -1; }
 }
 
-void signal_mgr_arm_timer(signal_mgr_t *m, int seconds) {
+void signal_mgr_arm_timer(signal_mgr_t *m, int milliseconds) {
+    if (milliseconds < 1) milliseconds = 1;
     struct itimerspec ts;
     ts.it_interval.tv_sec = 0;
     ts.it_interval.tv_nsec = 0;
-    ts.it_value.tv_sec = seconds;
-    ts.it_value.tv_nsec = 0;
+    ts.it_value.tv_sec = milliseconds / 1000;
+    ts.it_value.tv_nsec = (long)(milliseconds % 1000) * 1000000L;
     timerfd_settime(m->timer_fd, 0, &ts, NULL);
+}
+
+long long signal_mgr_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+int signal_mgr_debounce_delay(long long now_ms, long long deadline_ms, int debounce_ms) {
+    long long budget = deadline_ms - now_ms;
+    if (budget < 1) return 1;
+    if (budget < debounce_ms) return (int)budget;
+    return debounce_ms;
 }
 
 int signal_mgr_read_timer(signal_mgr_t *m) {

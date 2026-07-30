@@ -1,6 +1,6 @@
 # Предельные размеры watchlist в hrneo
 
-**Версия кода:** hrneo 3.15.0-1
+**Версия кода:** hrneo 3.17.0-1
 **Источник:** статический анализ `src/*.c`, `include/*.h`
 
 ---
@@ -67,8 +67,13 @@
 |----------|----------|------------|
 | `RCI_MAX_RESPONSE` | 1 МБ | Размер буферов `raw_buf` и `response_buf` |
 | `RCI_TIMEOUT_SEC` | 10 | `SO_RCVTIMEO` / `SO_SNDTIMEO` |
-| `POLICY_API_MAX_RETRIES` | 5 | Максимум попыток `GET /rci/show/ip/policy/` |
-| `POLICY_API_RETRY_DELAY` | 3 | Секунды между попытками |
+| `NF_COMMIT_DEBOUNCE_MS` | 2000 | Окно тишины после последнего SIGUSR1 |
+| `NF_COMMIT_MAX_DEFER_MS` | 10000 | Потолок откладывания при непрерывном дребезге |
+| `NF_COMMIT_RETRY_MIN_MS` | 1000 | Первый ретрай коммита netfilter |
+| `NF_COMMIT_RETRY_MAX_MS` | 60000 | Потолок экспоненциального backoff |
+| `IPT_DUMP_SIZE` | 32768 | Буфер дампа `iptables -t mangle -S` на семью |
+| `IPT_BATCH_SIZE` | 16384 | Буфер batch для `iptables-restore` на семью |
+| `IPT_MAX_RULE_ARGS` | 64 | Максимум argv-токенов при удалении правила |
 
 > **Жёстких лимитов на число доменов в коде нет** — пул растёт через цепочку чанков по 256 КБ.
 > **Длина строки в `domain.conf` и `ip.list` не ограничена** — оба файла читаются через `getline()` (динамический буфер). Прежнего лимита 4096 байт нет.
@@ -196,7 +201,7 @@ disabled-блок `#/Too-big-geoip-tag`:
 - Кольцо NFLOG-группы на стороне ядра: **128 КБ** (`NFLOG_NLBUFSIZ`); переполнение → `ENOBUFS` → `LOG_WARN`, копии теряются (мягкая деградация — трафик клиента не страдает), не fatal
 - Окно `connbytes` для `dport 443`: первые **`l7ConnbytesMax`** пакетов после SYN (default 8); для `dport 80` ужимается до `min(N, 4)`
 - WAN-интерфейс **один** (`l7WanInterface` или автодетект из `/proc/net/route`)
-- RST-инъекция (`src/l7_rst.c`): два raw-сокета (v4 `IPPROTO_RAW`, v6 `IPPROTO_TCP`) **без буферов и без лимитов** — RST крафтится на стеке (40 байт v4 / 60 байт v6) и отправляется единичным `sendto`; на потолок watchlist не влияет
+- Реконнект триггернувшего соединения — точечный `conntrack_delete_conn` по 5-tuple через `del_fd` (fire-and-forget, без `NLM_F_ACK`) **без буферов и без лимитов**; на потолок watchlist не влияет
 
 ---
 

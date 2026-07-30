@@ -10,10 +10,11 @@
 #define DEFAULT_API_PORT          79
 #define IPSET_HASH_TYPE           "hash:net"
 #define SOCKET_READ_BUFFER        (1024 * 1024)
-#define SIGUSR1_DEBOUNCE_SEC      5
+#define NF_COMMIT_DEBOUNCE_MS     2000
+#define NF_COMMIT_MAX_DEFER_MS    10000
+#define NF_COMMIT_RETRY_MIN_MS    1000
+#define NF_COMMIT_RETRY_MAX_MS    60000
 #define RCI_TIMEOUT_SEC           10
-#define POLICY_API_MAX_RETRIES    5
-#define POLICY_API_RETRY_DELAY    3
 #define IPSET_CHUNK_SIZE          256
 #define IPSET_DEFAULT_MAXELEM     262144
 #define POOL_CHUNK_SIZE           (256 * 1024)

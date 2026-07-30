@@ -124,7 +124,7 @@ static int rci_request(const char *method, const char *path,
     return response_len;
 }
 
-static int rci_get_policy_mark(const char *name, char *mark, int mark_size) {
+int rci_get_policy_mark(const char *name, char *mark, int mark_size) {
     char path[160];
     snprintf(path, sizeof(path), "/rci/show/ip/policy/%s/mark", name);
 
@@ -149,20 +149,6 @@ static int rci_get_policy_mark(const char *name, char *mark, int mark_size) {
 
     LOG_DEBUG("RCI policy: %s mark=0x%s", name, mark);
     return 1;
-}
-
-int rci_get_policy_mark_with_retry(const char *name, char *mark, int mark_size) {
-    for (int attempt = 0; attempt < POLICY_API_MAX_RETRIES; attempt++) {
-        int r = rci_get_policy_mark(name, mark, mark_size);
-        if (r >= 0) return r;
-        if (attempt < POLICY_API_MAX_RETRIES - 1) {
-            LOG_WARN("Policy API attempt %d/%d failed, retrying in %ds...",
-                     attempt + 1, POLICY_API_MAX_RETRIES, POLICY_API_RETRY_DELAY);
-            sleep(POLICY_API_RETRY_DELAY);
-        }
-    }
-    LOG_ERROR("Policy API failed after %d attempts", POLICY_API_MAX_RETRIES);
-    return -1;
 }
 
 int rci_create_policies(const char (*names)[64], int count) {

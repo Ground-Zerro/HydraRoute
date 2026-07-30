@@ -1,4 +1,5 @@
 #include "../include/l7_firewall.h"
+#include "../include/iptables.h"
 #include "../include/log.h"
 #include "../include/util.h"
 #include <stdio.h>
@@ -139,189 +140,92 @@ int l7_firewall_load_nflog_modules(void) {
     return 0;
 }
 
-static int build_rule_argv(char **out, char buf[][64],
-                           const char *cmd, const char *op, const char *chain,
-                           const char *wan, int dport, int connbytes_max,
-                           int group) {
-    int i = 0;
-    snprintf(buf[0],  64, "%s", cmd);     out[i++] = buf[0];
-    snprintf(buf[1],  64, "-w");          out[i++] = buf[1];
-    snprintf(buf[2],  64, "-t");          out[i++] = buf[2];
-    snprintf(buf[3],  64, "mangle");      out[i++] = buf[3];
-    snprintf(buf[4],  64, "%s", op);      out[i++] = buf[4];
-    snprintf(buf[5],  64, "%s", chain);   out[i++] = buf[5];
-    snprintf(buf[6],  64, "-o");          out[i++] = buf[6];
-    snprintf(buf[7],  64, "%s", wan);     out[i++] = buf[7];
-    snprintf(buf[8],  64, "-p");          out[i++] = buf[8];
-    snprintf(buf[9],  64, "tcp");         out[i++] = buf[9];
-    snprintf(buf[10], 64, "--dport");     out[i++] = buf[10];
-    snprintf(buf[11], 64, "%d", dport);   out[i++] = buf[11];
-    snprintf(buf[12], 64, "--tcp-flags"); out[i++] = buf[12];
-    snprintf(buf[13], 64, "SYN,ACK");     out[i++] = buf[13];
-    snprintf(buf[14], 64, "ACK");         out[i++] = buf[14];
-    snprintf(buf[15], 64, "-m");          out[i++] = buf[15];
-    snprintf(buf[16], 64, "connbytes");   out[i++] = buf[16];
-    snprintf(buf[17], 64, "--connbytes-dir=original"); out[i++] = buf[17];
-    snprintf(buf[18], 64, "--connbytes-mode=packets"); out[i++] = buf[18];
-    snprintf(buf[19], 64, "--connbytes");  out[i++] = buf[19];
-    snprintf(buf[20], 64, "2:%d", connbytes_max); out[i++] = buf[20];
-    snprintf(buf[21], 64, "-m");           out[i++] = buf[21];
-    snprintf(buf[22], 64, "length");       out[i++] = buf[22];
-    snprintf(buf[23], 64, "--length");     out[i++] = buf[23];
-    snprintf(buf[24], 64, "60:");          out[i++] = buf[24];
-    snprintf(buf[25], 64, "-j");           out[i++] = buf[25];
-    snprintf(buf[26], 64, "NFLOG");        out[i++] = buf[26];
-    snprintf(buf[27], 64, "--nflog-group"); out[i++] = buf[27];
-    snprintf(buf[28], 64, "%d", group);    out[i++] = buf[28];
-    out[i] = NULL;
-    return i;
-}
-
-static int rule_exists(const char *cmd, const char *chain, const char *wan,
-                       int dport, int connbytes_max, int group) {
-    char abuf[32][64];
-    char *argv[33];
-    build_rule_argv(argv, abuf, cmd, "-C", chain, wan, dport, connbytes_max, group);
-    char out[256];
-    int rc = run_command_output(cmd, argv, out, sizeof(out));
-    return rc == 0;
-}
-
-static int apply_one(const char *cmd, const char *op, const char *chain,
-                     const char *wan, int dport, int connbytes_max, int group) {
-    char abuf[32][64];
-    char *argv[33];
-    build_rule_argv(argv, abuf, cmd, op, chain, wan, dport, connbytes_max, group);
-    char out[256];
-    return run_command_output(cmd, argv, out, sizeof(out));
-}
-
 static const char *const L7_CMDS[]   = {"iptables", "ip6tables"};
 static const char *const L7_CHAINS[] = {"FORWARD", "OUTPUT"};
-
-static int build_quic_rule_argv(char **out, char buf[][64],
-                                const char *cmd, const char *op, const char *chain,
-                                const char *wan, int group) {
-    int i = 0;
-    snprintf(buf[0],  64, "%s", cmd);     out[i++] = buf[0];
-    snprintf(buf[1],  64, "-w");          out[i++] = buf[1];
-    snprintf(buf[2],  64, "-t");          out[i++] = buf[2];
-    snprintf(buf[3],  64, "mangle");      out[i++] = buf[3];
-    snprintf(buf[4],  64, "%s", op);      out[i++] = buf[4];
-    snprintf(buf[5],  64, "%s", chain);   out[i++] = buf[5];
-    snprintf(buf[6],  64, "-o");          out[i++] = buf[6];
-    snprintf(buf[7],  64, "%s", wan);     out[i++] = buf[7];
-    snprintf(buf[8],  64, "-p");          out[i++] = buf[8];
-    snprintf(buf[9],  64, "udp");         out[i++] = buf[9];
-    snprintf(buf[10], 64, "--dport");     out[i++] = buf[10];
-    snprintf(buf[11], 64, "443");         out[i++] = buf[11];
-    snprintf(buf[12], 64, "-m");          out[i++] = buf[12];
-    snprintf(buf[13], 64, "length");      out[i++] = buf[13];
-    snprintf(buf[14], 64, "--length");    out[i++] = buf[14];
-    snprintf(buf[15], 64, "1200:");       out[i++] = buf[15];
-    snprintf(buf[16], 64, "-j");          out[i++] = buf[16];
-    snprintf(buf[17], 64, "NFLOG");       out[i++] = buf[17];
-    snprintf(buf[18], 64, "--nflog-group"); out[i++] = buf[18];
-    snprintf(buf[19], 64, "%d", group);   out[i++] = buf[19];
-    out[i] = NULL;
-    return i;
-}
-
-static int quic_rule_exists(const char *cmd, const char *chain,
-                            const char *wan, int group) {
-    char abuf[22][64];
-    char *argv[23];
-    build_quic_rule_argv(argv, abuf, cmd, "-C", chain, wan, group);
-    char out[256];
-    return run_command_output(cmd, argv, out, sizeof(out)) == 0;
-}
-
-static int quic_apply_one(const char *cmd, const char *op, const char *chain,
-                          const char *wan, int group) {
-    char abuf[22][64];
-    char *argv[23];
-    build_quic_rule_argv(argv, abuf, cmd, op, chain, wan, group);
-    char out[256];
-    return run_command_output(cmd, argv, out, sizeof(out));
-}
 
 typedef struct {
     int dport;
     int connbytes_max;
 } l7_rule_spec_t;
 
-static int l7_rule_specs(const config_t *cfg, l7_rule_spec_t specs[2]) {
+static int l7_nflog_group(const config_t *cfg) {
+    return cfg->l7_nflog_group > 0 ? cfg->l7_nflog_group : 210;
+}
+
+static void l7_rule_specs(const config_t *cfg, l7_rule_spec_t specs[2]) {
     int max443 = cfg->l7_connbytes_max > 0 ? cfg->l7_connbytes_max : 8;
     specs[0].dport = 443;
     specs[0].connbytes_max = max443;
     specs[1].dport = 80;
     specs[1].connbytes_max = max443 < 4 ? max443 : 4;
-    return cfg->l7_nflog_group > 0 ? cfg->l7_nflog_group : 210;
 }
 
-int l7_firewall_install(const config_t *cfg, const char *wan_iface) {
-    if (!wan_iface || wan_iface[0] == '\0') return -1;
-    l7_rule_spec_t specs[2];
-    int group = l7_rule_specs(cfg, specs);
-    int installed = 0, present = 0;
+static int dump_has_rule(const char *dump, const char *chain, const char *wan,
+                         const char *proto, int dport, int group) {
+    char c_tok[40], o_tok[MAX_INTERFACE_NAME + 8], p_tok[16], d_tok[24], g_tok[32];
+    snprintf(c_tok, sizeof(c_tok), "-A %s ", chain);
+    snprintf(o_tok, sizeof(o_tok), "-o %s ", wan);
+    snprintf(p_tok, sizeof(p_tok), "-p %s ", proto);
+    snprintf(d_tok, sizeof(d_tok), "--dport %d ", dport);
+    snprintf(g_tok, sizeof(g_tok), "--nflog-group %d", group);
 
-    for (int c = 0; c < 2; c++) {
-        for (int ch = 0; ch < 2; ch++) {
-            for (int p = 0; p < 2; p++) {
-                if (rule_exists(L7_CMDS[c], L7_CHAINS[ch], wan_iface,
-                                specs[p].dport, specs[p].connbytes_max, group)) {
-                    present++;
-                    continue;
-                }
-                if (apply_one(L7_CMDS[c], "-A", L7_CHAINS[ch], wan_iface,
-                              specs[p].dport, specs[p].connbytes_max, group) == 0) {
-                    installed++;
-                } else {
-                    LOG_WARN("L7 firewall: %s -A %s dport=%d failed",
-                             L7_CMDS[c], L7_CHAINS[ch], specs[p].dport);
-                }
-            }
-
-            if (cfg->l7_enable_quic) {
-                if (quic_rule_exists(L7_CMDS[c], L7_CHAINS[ch], wan_iface, group)) {
-                    present++;
-                } else if (quic_apply_one(L7_CMDS[c], "-A", L7_CHAINS[ch],
-                                          wan_iface, group) == 0) {
-                    installed++;
-                } else {
-                    LOG_WARN("L7 firewall: %s -A %s udp/443 QUIC failed",
-                             L7_CMDS[c], L7_CHAINS[ch]);
-                }
-            }
-        }
+    const char *line = dump;
+    while (line && *line) {
+        const char *nl = strchr(line, '\n');
+        size_t len = nl ? (size_t)(nl - line) : strlen(line);
+        if (line_find(line, len, c_tok) == line &&
+            line_find(line, len, o_tok) && line_find(line, len, p_tok) &&
+            line_find(line, len, d_tok) && line_find(line, len, g_tok))
+            return 1;
+        line = nl ? nl + 1 : NULL;
     }
-    if (installed > 0)
-        LOG_INFO("L7 firewall rules installed (new=%d, already present=%d, wan=%s, nflog-group=%d)",
-                 installed, present, wan_iface, group);
     return 0;
+}
+
+int l7_firewall_emit_rules(const config_t *cfg, const char *wan,
+                           const char *dump, char *out, size_t out_size) {
+    if (!wan || wan[0] == '\0') return 0;
+    l7_rule_spec_t specs[2];
+    l7_rule_specs(cfg, specs);
+    int group = l7_nflog_group(cfg);
+    size_t off = 0;
+
+    for (int ch = 0; ch < 2; ch++) {
+        for (int p = 0; p < 2; p++) {
+            if (dump_has_rule(dump, L7_CHAINS[ch], wan, "tcp", specs[p].dport, group))
+                continue;
+            int n = snprintf(out + off, out_size - off,
+                "-A %s -o %s -p tcp --dport %d --tcp-flags SYN,ACK ACK "
+                "-m connbytes --connbytes-dir original --connbytes-mode packets "
+                "--connbytes 2:%d -m length --length 60: "
+                "-j NFLOG --nflog-group %d\n",
+                L7_CHAINS[ch], wan, specs[p].dport, specs[p].connbytes_max, group);
+            if (n < 0 || (size_t)n >= out_size - off) return -1;
+            off += (size_t)n;
+        }
+
+        if (!cfg->l7_enable_quic) continue;
+        if (dump_has_rule(dump, L7_CHAINS[ch], wan, "udp", 443, group)) continue;
+        int n = snprintf(out + off, out_size - off,
+            "-A %s -o %s -p udp --dport 443 -m length --length 1200: "
+            "-j NFLOG --nflog-group %d\n",
+            L7_CHAINS[ch], wan, group);
+        if (n < 0 || (size_t)n >= out_size - off) return -1;
+        off += (size_t)n;
+    }
+    return (int)off;
 }
 
 int l7_firewall_remove(const config_t *cfg, const char *wan_iface) {
     if (!wan_iface || wan_iface[0] == '\0') return -1;
-    l7_rule_spec_t specs[2];
-    int group = l7_rule_specs(cfg, specs);
 
-    for (int c = 0; c < 2; c++) {
-        for (int ch = 0; ch < 2; ch++) {
-            for (int p = 0; p < 2; p++) {
-                while (rule_exists(L7_CMDS[c], L7_CHAINS[ch], wan_iface,
-                                   specs[p].dport, specs[p].connbytes_max, group)) {
-                    if (apply_one(L7_CMDS[c], "-D", L7_CHAINS[ch], wan_iface,
-                                  specs[p].dport, specs[p].connbytes_max, group) != 0)
-                        break;
-                }
-            }
-            while (quic_rule_exists(L7_CMDS[c], L7_CHAINS[ch], wan_iface, group)) {
-                if (quic_apply_one(L7_CMDS[c], "-D", L7_CHAINS[ch],
-                                   wan_iface, group) != 0)
-                    break;
-            }
-        }
-    }
+    char o_tok[MAX_INTERFACE_NAME + 8], g_tok[32];
+    snprintf(o_tok, sizeof(o_tok), "-o %s ", wan_iface);
+    snprintf(g_tok, sizeof(g_tok), "--nflog-group %d", l7_nflog_group(cfg));
+
+    for (int c = 0; c < 2; c++)
+        for (int ch = 0; ch < 2; ch++)
+            iptables_delete_rules_matching(L7_CMDS[c], L7_CHAINS[ch], o_tok, g_tok);
+
     return 0;
 }

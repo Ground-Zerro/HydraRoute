@@ -160,11 +160,25 @@ int run_command_output(const char *cmd, char *const argv[], char *output, size_t
     while (total < output_size - 1 && (n = read(pipefd[0], output + total, output_size - 1 - total)) > 0)
         total += n;
     output[total] = '\0';
+
+    int truncated = 0;
+    char sink[512];
+    while (read(pipefd[0], sink, sizeof(sink)) > 0) truncated = 1;
     close(pipefd[0]);
 
     int status;
     waitpid(pid, &status, 0);
+    if (truncated) return -1;
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+const char *line_find(const char *line, size_t line_len, const char *needle) {
+    size_t nlen = strlen(needle);
+    if (nlen > line_len) return NULL;
+    for (size_t i = 0; i + nlen <= line_len; i++) {
+        if (memcmp(line + i, needle, nlen) == 0) return line + i;
+    }
+    return NULL;
 }
 
 int run_command_stdin(const char *cmd, char *const argv[], const char *input, size_t input_len) {

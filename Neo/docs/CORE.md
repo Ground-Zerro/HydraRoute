@@ -1,6 +1,6 @@
 # HRNeo — техническая документация кодовой базы
 
-Исходный код HRNeo (HydraRoute Neo) v3.15.0-1: архитектура, модули, потоки данных, оптимизации.
+Исходный код HRNeo (HydraRoute Neo) v3.17.0-1: архитектура, модули, потоки данных, оптимизации.
 
 ---
 
@@ -25,9 +25,11 @@ HRNeo — демон для policy routing на роутерах Keenetic (Entwa
 
    Результат: разделённые массивы `policy_names[]` и `iface_names[]`. Лог: `[INFO] domain.conf: %d policies, %d interfaces`.
 
-4. Опционально (`CIDR=true`): из `CIDRfile` (`ip.list`) извлекаются уникальные заголовки `/Name` через `parse_cidr_policy_headers`. Имена-интерфейсы фильтруются через `drm_classify_target`, остальные добавляются в список политик. Лог на каждое новое имя: `[INFO] CIDR: added policy 'X'`.
+4. Опционально (`CIDR=true`): из `CIDRfile` (`ip.list`) извлекаются уникальные заголовки `/Name` через `parse_cidr_policy_headers`. Каждое имя классифицируется через `drm_classify_target`: интерфейсы дописываются в `iface_names[]`, остальные — в список политик. Лог на каждое новое имя: `[INFO] CIDR: added policy 'X'`.
 
-5. Опционально (есть `GeoSiteFile`): `parse_geosite_rules` собирает `geosite:TAG/Цель` из watchlist'а; имена-цели добавляются в политики (опять же intf-цели отфильтровываются). Лог: `[INFO] GeoSite: added policy 'X'`.
+5. Опционально (есть `GeoSiteFile`): `parse_geosite_rules` собирает `geosite:TAG/Цель` из watchlist'а; цели раскладываются так же — интерфейсы в `iface_names[]`, политики в `policy_names[]`. Лог: `[INFO] GeoSite: added policy 'X'`.
+
+   После шагов 4-5 для каждого имени из `iface_names[]` выделяются `fwmark`/`table_id` и регистрируется маршрут (`drm_register_route`). Регистрация идёт именно здесь, а не сразу после watchlist'а: цель-интерфейс может быть объявлена только в `ip.list` или в `geosite:`-правиле, и без этого она не получала бы ни ipset (в т.ч. `FLUSH` на старте), ни `CONNMARK`-правило, ни `ip rule`.
 
 6. Применяется `PolicyOrder` через `sort_policies` (см. раздел [5](#5-матчинг-доменов-srcwatchlistc)). Сортировка делается дважды: для одних только политик (для шага 7) и для объединённого массива policy + iface (для шага 9). Итог печатается:
 
@@ -49,15 +51,15 @@ HRNeo — демон для policy routing на роутерах Keenetic (Entwa
 11. Если `DirectRoute=true` — `drm_setup_all_routes`:
 
     ```
-    ip [-6] rule add priority N fwmark 0x<mark> table <T>
-    ip [-6] route add default dev <iface> table <T>   # или blackhole
+    ip -4|-6 rule  add     priority N fwmark 0x<mark> table <T>
+    ip -4|-6 route replace default via <gw> dev <iface> table <T>   # или blackhole
     ```
 
     `fwmark` и `table_id` уникальные, выделяются последовательно от `InterfaceFwMarkStart` (12289) и `InterfaceTableStart` (301).
 
 12. **Извлечение `markID` политик через RCI** + создание `CONNMARK`-правил `iptables` (`apply_unified_connmark_rules`):
     - Для каждой цели-политики точечный `GET /rci/show/ip/policy/<Name>/mark` возвращает голое значение `"ffffaaa"` (~10 байт; HTTP 404 — политики нет). Полное дерево политик со всеми маршрутами не выкачивается, JSON-парсер не нужен — из ответа снимаются кавычки и префикс `0x`. Лог при `log=console/file`: `[DEBUG] RCI policy: HydraRoute mark=0xffffaaa`
-    - Двухуровневая retry-защита: `rci_get_policy_mark_with_retry` (до 5 попыток × 3с) от сетевых ошибок; внешний loop (до 5 попыток × 4с) от свежесозданных политик без `markID` (роутер назначает его не сразу после `parse`)
+    - Ретрая внутри RCI-клиента нет: и сетевая ошибка, и «политика создана, но `markID` ещё не назначен» дают `-1` из `apply_unified_connmark_rules`, а повтор с backoff обеспечивает коммитер (`commit_run`, 1→60 с, бесконечно). Один механизм ожидания вместо трёх вложенных, и он не блокирует epoll-цикл
     - Для целей-интерфейсов `markID` не запрашивается — используется назначенный `fwmark`
     - Для каждой цели в порядке `g_all_sorted[]` формируется пара `CONNMARK`-правил в `mangle/PREROUTING`, через `iptables-restore --noflush` (один вызов на весь батч). Если у политики `mark` пустой после retry — `LOG_WARN "Policy %s has no mark ID, skipping"`, цель пропускается (`ipset` продолжит заполняться, но трафик не маркируется)
 
@@ -107,7 +109,7 @@ DNS-ответ dnsmasq → клиент (любой интерфейс: br0/WG/V
    → iptables/mangle PREROUTING
    → CONNMARK set-xmark по ipset dst match
    → CONNMARK restore-mark
-   → ip rule fwmark → table X → ip route default dev <interface>
+   → ip rule fwmark → table X → default via <gw> dev <interface>
 ```
 
 ### Файловая структура (25 файлов `.c`)
@@ -156,10 +158,11 @@ DNS-ответ dnsmasq → клиент (любой интерфейс: br0/WG/V
 | `DEFAULT_API_PORT` | `79` | порт RCI |
 | `IPSET_HASH_TYPE` | `"hash:net"` | тип создаваемых ipset |
 | `SOCKET_READ_BUFFER` | 1 МБ | `SO_RCVBUF` для AF_PACKET |
-| `SIGUSR1_DEBOUNCE_SEC` | `5` | debounce SIGUSR1 (`signal_mgr_arm_timer`) |
+| `NF_COMMIT_DEBOUNCE_MS` | `2000` | окно тишины после последнего SIGUSR1 |
+| `NF_COMMIT_MAX_DEFER_MS` | `10000` | потолок откладывания при непрерывном дребезге |
+| `NF_COMMIT_RETRY_MIN_MS` | `1000` | первый ретрай коммита |
+| `NF_COMMIT_RETRY_MAX_MS` | `60000` | потолок экспоненциального backoff |
 | `RCI_TIMEOUT_SEC` | `10` | таймаут RCI-запроса |
-| `POLICY_API_MAX_RETRIES` | `5` | попыток на `GET /rci/show/ip/policy/` |
-| `POLICY_API_RETRY_DELAY` | `3` | секунды между попытками |
 | `IPSET_CHUNK_SIZE` | `256` | размер батча ipset |
 | `IPSET_DEFAULT_MAXELEM` | `262144` | fallback при `IpsetMaxElem=0` в `add_cidr_to_ipsets` |
 | `POOL_CHUNK_SIZE` | `256 * 1024` | размер одного чанка string pool |
@@ -212,9 +215,10 @@ int                     g_reasm_active;
 5. Если `!auto_start` → `return 0`
 6. `log_setup()` + `LOG_INFO "HRNeo v%s starting"` + `create_pid_file()`
 7. `ht_create()` — создание хеш-таблицы доменов
-8. Если DirectRoute: `drm_init()`, `drm_scan_interfaces()`, `parse_watchlist_classified()` → для каждого iface: `drm_allocate_fwmark()`, `drm_allocate_table_id()`, `drm_register_route()`. Иначе: `parse_watchlist()`, `get_unique_names()`
-9. `CIDR=true`: `parse_cidr_policy_headers()` — добавляет политики из заголовков `/Name` CIDR-файла; intf-цели отфильтровываются через `drm_classify_target`; `LOG_INFO "CIDR: added policy 'X'"` для каждой новой
-10. GeoSite файлы заданы: `parse_geosite_rules()` — добавляет политики из `geosite:`-правил watchlist; intf-цели отфильтровываются; `LOG_INFO "GeoSite: added policy 'X'"` для каждой новой
+8. Если DirectRoute: `drm_init()`, `drm_scan_interfaces()`, `parse_watchlist_classified()`. Иначе: `parse_watchlist()`, `get_unique_names()`
+9. `CIDR=true`: `parse_cidr_policy_headers()` — имена из заголовков `/Name` CIDR-файла раскладываются по `drm_classify_target` в `iface_names[]`/`policy_names[]`; `LOG_INFO "CIDR: added policy 'X'"` для каждой новой политики
+10. GeoSite файлы заданы: `parse_geosite_rules()` — цели `geosite:`-правил раскладываются так же; `LOG_INFO "GeoSite: added policy 'X'"` для каждой новой политики
+10a. Если DirectRoute: для каждого имени из `iface_names[]` — `drm_allocate_fwmark()`, `drm_allocate_table_id()`, `drm_register_route()`
 11. `sort_policies()` для `policy_names` с учётом `PolicyOrder`
 12. `g_all_sorted[]`: `all_names = policy_names + iface_names`, `sort_policies()` на объединении; `unified_target_t = {pair (ipv4/ipv6 имена), is_interface, fwmark}`
 13. `LOG_INFO "Target order (%d):"` — вывод порядка целей
@@ -223,12 +227,12 @@ int                     g_reasm_active;
 16. `add_cidr_to_ipsets()` — если `CIDR=true` и `cidr_file_path` задан
 17. `build_geosite_domain_map()` — если `gs_count > 0` (правила `geosite:` распарсены один раз на шаге 10 и переиспользуются)
 18. `drm_setup_all_routes()` — `ip rule` + `ip route` для DirectRoute
-19. `apply_unified_connmark_rules()`
-20. Если `conntrack_flush` — `conntrack_mgr_init()` (при ошибке flush отключается)
-21. `pkt_capture_init()` — два `AF_PACKET SOCK_DGRAM/ETH_P_ALL` сокета (`fd4`, `fd6`)
-22. Если `l7_capture_enabled`: `l7_firewall_resolve_wan` (при неудаче — L7 отключается с `LOG_WARN`, DNS-only); `l7_firewall_load_nflog_modules` (`nfnetlink_log`+`xt_NFLOG` через `init_module(2)`; при неудаче — L7 отключается, DNS-only, **без fallback**). Иначе: `l7_firewall_load_kmod("xt_connbytes")`; `l7_dispatch_set_enable` (с флагами tls/http/quic); при `l7_tcp_reasm_enabled` — `tcp_reasm_init` + `l7_dispatch_set_reasm` (`g_reasm_active=1`); `nflog_capture_init`; `l7_firewall_install` (NFLOG в `mangle/FORWARD`+`OUTPUT` для TCP 443/80 и при `l7_enable_quic` — UDP 443 с `--length 1200:`). `g_l7_active=1` при успехе
-23. `signal_mgr_init()` — `sigprocmask` + `signalfd` + `timerfd`
-24. `epoll_create1()` — регистрация `cap.fd4`, `cap.fd6`, `signals.sig_fd`, `signals.timer_fd`; при активном conntrack flush — `g_conntrack.fd` (async DUMP); при `g_l7_active` — `nflog_fd`; при `g_reasm_active` — `reasm_gc_fd` (`timerfd` 1s)
+19. Если `conntrack_flush` — `conntrack_mgr_init()` (при ошибке flush отключается)
+20. `pkt_capture_init()` — два `AF_PACKET SOCK_DGRAM/ETH_P_ALL` сокета (`fd4`, `fd6`)
+21. Если `l7_capture_enabled`: `l7_firewall_resolve_wan` (при неудаче — L7 отключается с `LOG_WARN`, DNS-only); `l7_firewall_load_nflog_modules` (`nfnetlink_log`+`xt_NFLOG` через `init_module(2)`; при неудаче — L7 отключается, DNS-only, **без fallback**). Иначе: `l7_firewall_load_kmod("xt_connbytes")`; `l7_dispatch_set_enable` (с флагами tls/http/quic); при `l7_tcp_reasm_enabled` — `tcp_reasm_init` + `l7_dispatch_set_reasm` (`g_reasm_active=1`); `nflog_capture_init` → `g_l7_active=1`. Правила NFLOG **не ставятся здесь** — они входят в общий batch коммитера (шаг 24)
+22. `signal_mgr_init()` — `sigprocmask` + `signalfd` + `timerfd`
+23. `epoll_create1()` — регистрация `cap.fd4`, `cap.fd6`, `signals.sig_fd`, `signals.timer_fd`; при активном conntrack flush — `g_conntrack.fd` (async DUMP); при `g_l7_active` — `nflog_fd`; при `g_reasm_active` — `reasm_gc_fd` (`timerfd` 1s)
+24. `commit_run()` — первый коммит netfilter (тот же путь, что и по SIGUSR1, с тем же backoff-ретраем)
 25. Основной цикл `epoll_wait` (`events[8]`)
 26. **Cleanup:** `signal_mgr_close` → `l7_firewall_remove` + `nflog_capture_close` → `tcp_reasm_close` (если `g_reasm_active`) → `pkt_capture_close` → `conntrack_mgr_close` → `drm_cleanup_all_routes` → `cleanup_connmark_rules` → `ipset_manager_close` → `ht_destroy` → `remove_pid_file` → `log_close`
 
@@ -379,7 +383,9 @@ BFS-обход CNAME-цепочки (до `MAX_CNAME_CHAIN=16` шагов). По
 
 ### PolicyOrder — единственный механизм приоритезации целей
 
-Работает на **ДВУХ уровнях независимо**:
+Политики Keenetic и цели-интерфейсы DirectRoute равноправны: `sort_policies`
+работает по единому массиву без различия типов, `get_policy_priority` — по
+одному имени. Работает на **ДВУХ уровнях независимо**:
 
 **1) Порядок CONNMARK-правил в `iptables/mangle/PREROUTING`**
 
@@ -504,20 +510,22 @@ struct pool_chunk {
 **Файл:** `src/iptables.c`, функция `apply_unified_connmark_rules()`.
 
 1. `get_br0_global_ipv6()`: `ip addr show br0` — получает IPv6-сеть `scope global` (нужна только она: IPv6-правила для политик ставятся лишь при её наличии)
-2. Внутренний retry loop (до 5 попыток, sleep 4s): для каждой не-interface цели точечный `rci_get_policy_mark_with_retry()` в `policy_marks[i]` (индекс общий с `targets[]`). Если хотя бы одна политика без `mark` — повтор через 4 секунды
-3. Оба семейства обрабатываются единым кодом через массив дескрипторов `connmark_family_t[2]` (`{ipt_cmd, restore_cmd, rules_cache, batch}`: `iptables`/`iptables-restore` и `ip6tables`/`ip6tables-restore`); для каждого семейства кэшируются текущие правила `-w -t mangle -S PREROUTING`
+2. Для каждой не-interface цели один точечный `rci_get_policy_mark()` в `policy_marks[i]` (индекс общий с `targets[]`). Транспортная ошибка → немедленный возврат `-1`. Политика без `markID` → `incomplete=1`: остальные цели всё равно применяются, но функция вернёт `-1`. Блокирующих `sleep` нет — ожидание берёт на себя backoff коммитера
+3. Оба семейства обрабатываются единым кодом через массив дескрипторов `connmark_family_t[2]` (`{ipt_cmd, restore_cmd, dump, batch}`: `iptables`/`iptables-restore` и `ip6tables`/`ip6tables-restore`); для каждого семейства читается **вся таблица** `-w -t mangle -S` одним вызовом. Ошибка или обрезание вывода → `-1`
 4. Для каждого `unified_target` × семейство:
-   - **Интерфейс:** `mark = fwmark` (hex); **Политика:** `mark` из RCI-ответа; если `mark` пуст — цель пропускается с `[WARN]`
-   - `find_mark_in_rules()` по кэшу семейства; правило актуально → пропуск
+   - **Интерфейс:** `mark = fwmark` (hex); **Политика:** `mark` из RCI-ответа; если `mark` пуст — цель пропускается
+   - `find_mark_in_rules()` по дампу семейства (строка обязана начинаться с `-A PREROUTING `); правило актуально → пропуск
    - IPv6-правило для политики не создаётся, если у `br0` нет глобального IPv6
-   - Если `mark` изменился — `remove_connmark_rules_for()`, пара правил добавляется в batch семейства
-5. Каждый непустой batch → один вызов `iptables-restore --noflush` / `ip6tables-restore --noflush`
+   - Если `mark` изменился — `iptables_delete_rules_matching()`, пара правил добавляется в batch семейства
+5. Если L7 активен — `l7_firewall_emit_rules()` дописывает недостающие NFLOG-правила `FORWARD`/`OUTPUT` **в тот же batch** (наличие определяется по тому же дампу)
+6. Каждый непустой batch → один вызов `iptables-restore --noflush` / `ip6tables-restore --noflush`. Ненулевой код возврата или переполнение batch → `-1`
+7. Возврат: `0` — таблица приведена в целевое состояние полностью; `-1` — коммитер повторит с backoff
 
 #### Правила CONNMARK (`GlobalRouting=false`)
 
 ```
 -A PREROUTING -m mark ! --mark 0xffffaa0/0xffffff0
-   -m connmark --mark 0x0/0xffff0000
+   -m connmark --mark 0x0/0xffffffff
    -m set --match-set <ipset> dst
    -j CONNMARK --set-xmark 0x<mark>/0xffffffff
 
@@ -526,6 +534,32 @@ struct pool_chunk {
 ```
 
 `GlobalRouting=true`: условие `! --mark 0xffffaa0/0xffffff0` убирается.
+
+#### Guard `-m connmark --mark 0x0/0xffffffff`
+
+Маска покрывает **весь** марк. Это условие «соединение ещё никем не
+промаркировано» — оно и реализует «первое совпадение выигрывает» для целей
+любого типа: `markID` политики (`0xffffaaa`) и `fwmark` интерфейса (`0x3001`)
+проверяются одинаково.
+
+Маска обязана быть полной. `fwmark` целей-интерфейсов
+(`InterfaceFwmarkStart`, по умолчанию `12289` = `0x3001`) лежит в младших 16
+битах, поэтому при маске `0xffff0000` условие оставалось истинным и **после**
+маркировки: правило каждой следующей цели перезаписывало марк предыдущей, и при
+попадании IP сразу в несколько `ipset` выигрывала последняя цель, а не первая по
+`PolicyOrder`. Для политик Keenetic баг не проявлялся — их марки заняты в
+старших битах.
+
+Следствие: марк ставится на соединение **ровно один раз**, дальше работает
+только `--restore-mark`. Соединение, установленное до попадания IP в нужный
+`ipset`, доживает на прежнем маршруте до истечения conntrack-записи и не
+перескакивает в середине сессии. Для политик так было всегда; цели-интерфейсы
+перемаркировывались на каждом пакете — теперь поведение общее.
+
+Уровнем выше стоит **привязка устройства к политике в самом Keenetic**:
+`ndm` ставит марк `0xffffaaX` до правил hrneo, и условие
+`! --mark 0xffffaa0/0xffffff0` заставляет hrneo уступить целиком. `PolicyOrder`
+на этот уровень не влияет — снимается только `GlobalRouting=true`.
 
 #### `unified_target_t` (`include/iptables.h`)
 
@@ -566,13 +600,35 @@ struct pool_chunk {
 #### Настройка маршрутов (`drm_setup_all_routes`)
 
 ```
-ip [-6] rule  add priority N fwmark 0x<mark> table <tableID>
-ip [-6] route add default dev <interface> table <tableID>   # или blackhole если DOWN
+ip -4|-6 rule    add     priority N fwmark 0x<mark> table <tableID>
+ip -4|-6 route   replace default via <gw> dev <interface> table <tableID>
+ip -4|-6 route   replace blackhole default table <tableID>    # если DOWN
 ```
 
-`"can't find device"` → `blackhole` вместо ошибки.
+Семейство задаётся явным `-4`/`-6` на каждом вызове `ip`: без него селектор
+`default` в командах вида `route show table all default dev X` игнорируется и в
+выборку попадают маршруты обоих семейств.
 
-**IP Rule Priority:** `9 - (table_id - table_start)`, минимум 1.
+**Шлюз (`drm_lookup_gateway`).** Перед установкой маршрута nexthop ищется в
+`ip -4|-6 route show table all default dev <interface>` — берётся первая строка
+с ` via `, строки собственной таблицы (`table <tableID>`) пропускаются, чтобы не
+зациклиться на своём же прошлом значении при смене шлюза. Найден → `default via
+<gw> dev <iface>`, не найден → `default dev <iface>` как раньше.
+
+Без этого DirectRoute на Ethernet-WAN не работал: `default dev eth3 scope link`
+заставляет ядро искать nexthop равным самому адресу назначения и слать ARP на
+публичный IP в сеть провайдера. Туннели (PPP, WireGuard — `POINTOPOINT,NOARP`)
+шлюза не имеют и работали, поэтому дефект был виден только на провайдерских
+интерфейсах. Источник шлюза — per-interface таблицы NDMS (`16385`, `16393`, …),
+они есть и для резервных WAN, не только для текущего дефолтного.
+
+`replace` вместо `add`: идемпотентно без разбора `"File exists"` и переставляет
+маршрут при смене шлюза (обновление адреса по DHCP). `"can't find device"` →
+`blackhole` вместо ошибки.
+
+**IP Rule Priority:** `9 - (table_id - table_start)`, минимум 1. На разрешение
+коллизий не влияет — `fwmark` у каждого интерфейса свой, правила
+взаимоисключающие.
 
 #### Прочие функции
 
@@ -598,19 +654,41 @@ ip [-6] route add default dev <interface> table <tableID>   # или blackhole �
 ### Прочие функции
 
 - `signal_mgr_close(m)` — close обоих `fd`
-- `signal_mgr_arm_timer(m, seconds)` — one-shot через `timerfd_settime`
+- `signal_mgr_arm_timer(m, milliseconds)` — one-shot через `timerfd_settime`
 - `signal_mgr_read_timer(m)` — `read()` expirations
 
 ### Логика обработки (`main.c`, epoll loop)
 
-**`SIGUSR1`:**
+Коммитер netfilter — trailing-edge state machine на одном `timer_fd`. Требование
+NDMS (см. `NETFILTER_RACE.md`): накапливать вызовы `netfilter.d`, прерывать
+текущую запись при новом вызове, повторять при любой ошибке записи.
 
-- `timer_active=false`: `perform_update()` (при `g_drm_active` — `drm_get_states` + `drm_update_used_states` + `drm_handle_state_changes`; всегда — `apply_unified_connmark_rules`; при `g_l7_active && g_l7_wan[0]` — `l7_firewall_install`); `signal_mgr_arm_timer(SIGUSR1_DEBOUNCE_SEC)`; `timer_active=1`
-- `timer_active=true`: `pending_update=1`
+**`SIGUSR1`:** `g_commit_retry=0`; таймер взводится на
+`signal_mgr_debounce_delay(now, g_commit_deadline, NF_COMMIT_DEBOUNCE_MS)`.
+Никакой работы в обработчике — каждый новый сигнал только сдвигает окно, пачка
+из N хуков даёт ровно один коммит.
 
-**Debounce timer expired:**
+`g_commit_deadline` (0 = ничего не отложено) ставится первым сигналом пачки в
+`now + NF_COMMIT_MAX_DEFER_MS` и обнуляется при срабатывании таймера. Без этого
+потолка непрерывный дребезг голодает коммит бесконечно: замер на роутере —
+хук с частотой 1 Гц в течение 25 с держал таблицу пустой все 25 с. С потолком
+задержка сжимается по мере приближения дедлайна (2000 → 1034 → 850 мс), простой
+ограничен ~10 с, и при затяжном флапе коммит повторяется каждые ~10 с.
 
-- `signal_mgr_read_timer`; если `pending_update=1` → повторный `perform_update()`; сброс `timer_active=0` и `pending_update=0`
+**`timer_fd`:** `signal_mgr_read_timer` → `commit_run()`:
+
+- `perform_update()` = при `g_drm_active` — `drm_get_states` +
+  `drm_update_used_states` + `drm_handle_state_changes` + `drm_setup_all_routes`
+  (последний восстанавливает `ip rule`/`ip route` после NDMS: маршруты идемпотентны
+  через `ip route replace`, `ip rule` — по «File exists»); всегда — `apply_unified_connmark_rules(..., &g_config,
+  g_l7_active ? g_l7_wan : NULL)`
+- возврат `0` → `LOG_INFO "netfilter rules committed"`, `g_commit_retry=0`
+- возврат `-1` → backoff `NF_COMMIT_RETRY_MIN_MS << g_commit_retry`, потолок
+  `NF_COMMIT_RETRY_MAX_MS`; таймер перевзводится, счётчик инкрементируется.
+  Ретраи не заканчиваются: система самовосстанавливается без внешних событий
+
+Стартовый коммит (шаг 24 инициализации) идёт через тот же `commit_run()` —
+отдельного пути установки правил нет.
 
 **`SIGINT`/`SIGTERM`:** `g_shutdown=1` → выход из epoll loop → cleanup.
 
@@ -635,7 +713,7 @@ ip [-6] route add default dev <interface> table <tableID>   # или blackhole �
 - `target` пустой → `hrneo.conf` рядом с бинарём (`readlink /proc/self/exe → dirname`)
 - `target`-каталог (или со слешем) → `<dir>/hrneo.conf`
 - `target`-файл → записывается ровно по пути
-- Записывает все 27 ключей с дефолтами; пустые multi-value ключи как `Key=`
+- Записывает все 29 ключей с дефолтами; пустые multi-value ключи как `Key=`
 
 > Полное описание ключей и поведения — в `docs/HRNEO.CONF.md`.
 
@@ -819,8 +897,6 @@ hrneo взаимодействует с роутером Keenetic **исключ
 |-----------|----------|------------|
 | `RCI_PORT` | `DEFAULT_API_PORT` (79) | захардкожен, параметра конфига нет |
 | `RCI_RAW_MAX` (rci.c) | `32768` | статический приёмный буфер `rci_request` |
-| `POLICY_API_MAX_RETRIES` | `5` | попыток на точечный `GET .../mark` |
-| `POLICY_API_RETRY_DELAY` | `3` (секунды) | интервал между попытками |
 | `RCI_TIMEOUT_SEC` | `10` | `SO_RCVTIMEO` и `SO_SNDTIMEO` |
 
 Клиент не имеет состояния и heap-аллокаций: приёмный буфер — статический 32 КБ в `rci_request` (однопоточный демон), ответы точечных GET — десятки байт. Ранее держались два `malloc`-буфера по ~1 МБ на весь lifetime демона ради разового парсинга полного дерева политик.
@@ -873,10 +949,10 @@ GET /rci/show/ip/policy/NoSuch/mark      →  HTTP 404
 
 Полное дерево `/rci/show/ip/policy/` (JSON со всеми маршрутами всех политик, растёт с числом маршрутов без ограничений) не выкачивается и не парсится — ручной скобочный парсер и мегабайтные буферы удалены вместе с риском молчаливой поломки на обрезанном ответе.
 
-#### `rci_get_policy_mark_with_retry(name, mark, mark_size)`
+#### `rci_get_policy_mark(name, mark, mark_size)`
 
-- До `POLICY_API_MAX_RETRIES=5` попыток с интервалом `POLICY_API_RETRY_DELAY=3` секунды **только при транспортных ошибках** (`-1`); `0`/«нет марка» не ретраится здесь — это дело внешнего loop в `apply_unified_connmark_rules`
-- `LOG_WARN` при неудаче, `LOG_ERROR` при исчерпании
+- Без ретраев и без `sleep`: `1` — марк получен, `0` — политика есть, `markID` ещё не назначен, `-1` — транспортная ошибка
+- Повтор — забота `commit_run()` в `main.c` (backoff 1→60 с)
 
 ### Создание политик
 
@@ -900,13 +976,15 @@ GET /rci/show/ip/policy/NoSuch/mark      →  HTTP 404
 #### `main.c` (порядок старта)
 
 - 14. `rci_create_policies(policy_names, policy_count)` — создание политик для всех целей-политик (интерфейсы DirectRoute сюда не попадают)
-- 19. `apply_unified_connmark_rules(...)` — первое применение правил
+- 24. `commit_run()` — первое применение правил
 
-#### `iptables.c::apply_unified_connmark_rules` — вызывается при старте и на `SIGUSR1`
+#### `iptables.c::apply_unified_connmark_rules` — вызывается только из `commit_run()`
 
-Шаг 2: retry loop (до 5, sleep 4s) — внутри для каждой не-interface цели `rci_get_policy_mark_with_retry` в `policy_marks[i]` (индекс совпадает с `targets[]`). Если хотя бы у одной политики `mark` пустой (только что создана, роутер ещё не назначил `markID`) → повтор всего блока через 4 секунды. Двухуровневая защита: `rci_get_policy_mark_with_retry` ловит сетевые ошибки/таймауты, apply-loop ловит «политика создана, но без `markID`».
-
-Если после всех попыток `markID` не появился — `LOG_WARN "Policy %s has no mark ID, skipping"`. Цель пропускается в этой итерации правил, но `ipset` продолжает заполняться DNS/L7-каналами. На следующем `SIGUSR1` цикл повторяется.
+Шаг 2: по одному `rci_get_policy_mark` на не-interface цель, без ретраев и `sleep`.
+Если у политики `mark` пустой (только что создана, роутер ещё не назначил `markID`) —
+`LOG_WARN "Policy %s has no mark ID yet"`, цель пропускается в этом батче, функция
+возвращает `-1`. Коммитер повторит через 1, 2, 4, 8… до 60 с. Тем временем `ipset`
+продолжает заполняться DNS/L7-каналами, а остальные цели уже промаркированы.
 
 > **Главное правило:** hrneo не молчит при проблемах с RCI, но и не валится — при недоступности роутера демон продолжает работать в degraded-режиме (`ipset` заполняется, конкретные политики временно без CONNMARK-правил).
 
@@ -978,7 +1056,7 @@ GET /rci/show/ip/policy/NoSuch/mark      →  HTTP 404
 
 ## 16. Система сборки: Makefile
 
-**Версия:** 3.15.0-1
+**Версия:** 3.17.0-1
 **Язык:** C (без CGO, без внешних библиотек)
 
 ### Кросс-компиляция
@@ -1132,7 +1210,7 @@ NFQUEUE-десинхронизаторов (zapret2/nfqws2/tpws) — они ра
 
 ## Резюме
 
-**HRNeo v3.15.0-1** — компактный однопоточный policy routing демон для роутеров Keenetic, написанный на чистом C.
+**HRNeo v3.17.0-1** — компактный однопоточный policy routing демон для роутеров Keenetic, написанный на чистом C.
 
 Два источника имён хостов:
 

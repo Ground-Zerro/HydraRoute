@@ -94,7 +94,7 @@ static int run_ip(int ipv6, const char *const tail[], char *out, size_t out_size
     char *argv[16];
     int i = 0;
     argv[i++] = "ip";
-    if (ipv6) argv[i++] = "-6";
+    argv[i++] = ipv6 ? "-6" : "-4";
     for (int j = 0; tail[j] && i < 15; j++)
         argv[i++] = (char *)tail[j];
     argv[i] = NULL;
@@ -144,10 +144,34 @@ static int add_blackhole(int table_id, int ipv6) {
     char table_str[16];
     snprintf(table_str, sizeof(table_str), "%d", table_id);
     char output[256];
-    const char *tail[] = { "route", "add", "blackhole", "default", "table", table_str, NULL };
-    int ret = run_ip(ipv6, tail, output, sizeof(output));
-    if (ret != 0 && strstr(output, "File exists")) return 0;
-    return ret;
+    const char *tail[] = { "route", "replace", "blackhole", "default", "table", table_str, NULL };
+    return run_ip(ipv6, tail, output, sizeof(output));
+}
+
+static int drm_lookup_gateway(const char *iface_name, int table_id, int ipv6,
+                              char *gw, size_t gw_size) {
+    char table_needle[24];
+    snprintf(table_needle, sizeof(table_needle), "table %d ", table_id);
+
+    char output[2048];
+    const char *tail[] = { "route", "show", "table", "all", "default", "dev",
+                           (char *)iface_name, NULL };
+    if (run_ip(ipv6, tail, output, sizeof(output)) != 0) return 0;
+
+    char *saveptr;
+    for (char *line = strtok_r(output, "\n", &saveptr); line;
+         line = strtok_r(NULL, "\n", &saveptr)) {
+        if (strstr(line, table_needle)) continue;
+        const char *via = strstr(line, " via ");
+        if (!via) continue;
+        via += 5;
+        size_t len = strcspn(via, " \t");
+        if (len == 0 || len >= gw_size) continue;
+        memcpy(gw, via, len);
+        gw[len] = '\0';
+        return 1;
+    }
+    return 0;
 }
 
 static int drm_iface_active(const char *state) {
@@ -171,18 +195,26 @@ static void drm_install_route(const char *iface_name, int table_id, int active, 
     char table_str[16];
     snprintf(table_str, sizeof(table_str), "%d", table_id);
     char output[512];
-    const char *tail[] = { "route", "add", "default", "dev", iface_name,
-                           "table", table_str, NULL };
-    int ret = run_ip(ipv6, tail, output, sizeof(output));
+
+    char gw[64];
+    int have_gw = drm_lookup_gateway(iface_name, table_id, ipv6, gw, sizeof(gw));
+
+    const char *tail_gw[] = { "route", "replace", "default", "via", gw, "dev", iface_name,
+                              "table", table_str, NULL };
+    const char *tail_dev[] = { "route", "replace", "default", "dev", iface_name,
+                               "table", table_str, NULL };
+    int ret = run_ip(ipv6, have_gw ? tail_gw : tail_dev, output, sizeof(output));
 
     if (ret == 0) {
-        LOG_INFO("Added route (%s): default dev %s table %d",
-                 ipv6 ? "IPv6" : "IPv4", iface_name, table_id);
+        if (have_gw)
+            LOG_INFO("Added route (%s): default via %s dev %s table %d",
+                     ipv6 ? "IPv6" : "IPv4", gw, iface_name, table_id);
+        else
+            LOG_INFO("Added route (%s): default dev %s table %d",
+                     ipv6 ? "IPv6" : "IPv4", iface_name, table_id);
         return;
     }
-    if (strstr(output, "File exists"))
-        return;
-    if (strstr(output, "can't find device")) {
+    if (strstr(output, "can't find device") || strstr(output, "Cannot find device")) {
         LOG_WARN("Interface %s not in kernel routing stack (%s), using blackhole",
                  iface_name, ipv6 ? "IPv6" : "IPv4");
         add_blackhole(table_id, ipv6);

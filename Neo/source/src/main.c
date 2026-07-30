@@ -43,6 +43,8 @@ static int g_l7_active;
 static char g_l7_wan[MAX_INTERFACE_NAME];
 static tcp_reasm_t g_reasm;
 static int g_reasm_active;
+static int g_commit_retry;
+static long long g_commit_deadline;
 
 static int create_pid_file(const char *path) {
     FILE *f = fopen(path, "r");
@@ -242,18 +244,35 @@ static void process_dns_packet(const uint8_t *pkt, int pkt_len, void *user_data)
     }
 }
 
-static void perform_update(void) {
+static int perform_update(void) {
     if (g_drm_active) {
         char old_states[MAX_INTERFACES][2][32];
         int old_count;
         drm_get_states(&g_drm, old_states, &old_count);
         drm_update_used_states(&g_drm);
         drm_handle_state_changes(&g_drm, (const char (*)[2][32])old_states, old_count);
+        drm_setup_all_routes(&g_drm);
     }
-    apply_unified_connmark_rules(g_all_sorted, g_all_sorted_count, g_config.global_routing);
-    if (g_config.l7_capture_enabled && g_l7_active && g_l7_wan[0])
-        l7_firewall_install(&g_config, g_l7_wan);
-    LOG_INFO("iptables updated");
+    return apply_unified_connmark_rules(g_all_sorted, g_all_sorted_count, &g_config,
+                                        g_l7_active ? g_l7_wan : NULL);
+}
+
+static void commit_run(signal_mgr_t *m) {
+    if (perform_update() == 0) {
+        if (g_commit_retry > 0)
+            LOG_INFO("netfilter rules committed after %d retries", g_commit_retry);
+        else
+            LOG_INFO("netfilter rules committed");
+        g_commit_retry = 0;
+        return;
+    }
+
+    int shift = g_commit_retry < 16 ? g_commit_retry : 16;
+    long delay = (long)NF_COMMIT_RETRY_MIN_MS << shift;
+    if (delay > NF_COMMIT_RETRY_MAX_MS) delay = NF_COMMIT_RETRY_MAX_MS;
+    g_commit_retry++;
+    LOG_WARN("netfilter commit incomplete, retry %d in %ld ms", g_commit_retry, delay);
+    signal_mgr_arm_timer(m, (int)delay);
 }
 
 static void add_unique_name(char names[][64], int *count, const char *name, int max) {
@@ -349,12 +368,6 @@ int main(int argc, char *argv[]) {
             LOG_ERROR("Failed to parse watchlist (classified)");
             goto cleanup;
         }
-
-        for (int i = 0; i < iface_count; i++) {
-            int fwmark = drm_allocate_fwmark(&g_drm, iface_names[i]);
-            int table_id = drm_allocate_table_id(&g_drm, iface_names[i]);
-            drm_register_route(&g_drm, iface_names[i], fwmark, table_id);
-        }
     } else {
         if (parse_watchlist(g_config.watchlist_path, g_all_targets) != 0) {
             LOG_ERROR("Failed to parse watchlist");
@@ -369,8 +382,9 @@ int main(int argc, char *argv[]) {
         int cidr_count = parse_cidr_policy_headers(g_config.cidr_file_path, cidr_names, MAX_POLICY_ORDER);
         for (int i = 0; i < cidr_count; i++) {
             if (g_drm_active && drm_classify_target(&g_drm, cidr_names[i]))
-                continue;
-            add_unique_name(policy_names, &policy_count, cidr_names[i], MAX_POLICY_ORDER);
+                add_unique_name(iface_names, &iface_count, cidr_names[i], MAX_INTERFACES);
+            else
+                add_unique_name(policy_names, &policy_count, cidr_names[i], MAX_POLICY_ORDER);
         }
         for (int i = pc_before; i < policy_count; i++)
             LOG_INFO("CIDR: added policy '%s'", policy_names[i]);
@@ -384,11 +398,20 @@ int main(int argc, char *argv[]) {
         if (gs_count < 0) gs_count = 0;
         for (int i = 0; i < gs_count; i++) {
             if (g_drm_active && drm_classify_target(&g_drm, gs_rules[i].policy_name))
-                continue;
-            add_unique_name(policy_names, &policy_count, gs_rules[i].policy_name, MAX_POLICY_ORDER);
+                add_unique_name(iface_names, &iface_count, gs_rules[i].policy_name, MAX_INTERFACES);
+            else
+                add_unique_name(policy_names, &policy_count, gs_rules[i].policy_name, MAX_POLICY_ORDER);
         }
         for (int i = pc_before; i < policy_count; i++)
             LOG_INFO("GeoSite: added policy '%s'", policy_names[i]);
+    }
+
+    if (g_drm_active) {
+        for (int i = 0; i < iface_count; i++) {
+            int fwmark = drm_allocate_fwmark(&g_drm, iface_names[i]);
+            int table_id = drm_allocate_table_id(&g_drm, iface_names[i]);
+            drm_register_route(&g_drm, iface_names[i], fwmark, table_id);
+        }
     }
 
     sort_policies(policy_names, policy_count,
@@ -474,8 +497,6 @@ int main(int argc, char *argv[]) {
         drm_setup_all_routes(&g_drm);
     }
 
-    apply_unified_connmark_rules(g_all_sorted, g_all_sorted_count, g_config.global_routing);
-
     if (g_config.conntrack_flush) {
         if (conntrack_mgr_init(&g_conntrack) != 0) {
             LOG_WARN("conntrack manager init failed; conntrack flush disabled");
@@ -518,16 +539,11 @@ int main(int argc, char *argv[]) {
 
             if (nflog_capture_init(&g_nflog, (uint16_t)g_config.l7_nflog_group,
                                    l7_dispatch_packet, NULL) == 0) {
-                if (l7_firewall_install(&g_config, g_l7_wan) == 0) {
-                    g_l7_active = 1;
-                    LOG_INFO("L7 capture enabled via NFLOG group #%d (TLS=%d HTTP=%d QUIC=%d)",
-                             g_config.l7_nflog_group,
-                             g_config.l7_enable_tls, g_config.l7_enable_http,
-                             g_config.l7_enable_quic);
-                } else {
-                    LOG_WARN("L7 firewall install failed; closing NFLOG, DNS-only mode");
-                    nflog_capture_close(&g_nflog);
-                }
+                g_l7_active = 1;
+                LOG_INFO("L7 capture enabled via NFLOG group #%d (TLS=%d HTTP=%d QUIC=%d)",
+                         g_config.l7_nflog_group,
+                         g_config.l7_enable_tls, g_config.l7_enable_http,
+                         g_config.l7_enable_quic);
             } else {
                 LOG_WARN("L7 capture init failed; continuing with DNS only");
             }
@@ -589,8 +605,7 @@ int main(int argc, char *argv[]) {
 
     LOG_INFO("Packet capture started, waiting for DNS responses...");
 
-    int timer_active = 0;
-    int pending_update = 0;
+    commit_run(&signals);
 
     struct epoll_event events[8];
     while (!g_shutdown) {
@@ -621,27 +636,20 @@ int main(int argc, char *argv[]) {
                         LOG_INFO("Received signal %d, shutting down...", si.ssi_signo);
                         g_shutdown = 1;
                     } else if (si.ssi_signo == SIGUSR1) {
-                        if (!timer_active) {
-                            LOG_INFO("SIGUSR1 received, updating iptables rules...");
-                            timer_active = 1;
-                            pending_update = 0;
-                            perform_update();
-                            signal_mgr_arm_timer(&signals, SIGUSR1_DEBOUNCE_SEC);
-                        } else {
-                            LOG_INFO("SIGUSR1 received during timer, deferring update...");
-                            pending_update = 1;
-                        }
+                        long long now = signal_mgr_now_ms();
+                        if (g_commit_deadline == 0)
+                            g_commit_deadline = now + NF_COMMIT_MAX_DEFER_MS;
+                        int delay = signal_mgr_debounce_delay(now, g_commit_deadline,
+                                                              NF_COMMIT_DEBOUNCE_MS);
+                        LOG_DEBUG("SIGUSR1 received, commit in %d ms", delay);
+                        g_commit_retry = 0;
+                        signal_mgr_arm_timer(&signals, delay);
                     }
                 }
             } else if (events[i].data.fd == signals.timer_fd) {
                 signal_mgr_read_timer(&signals);
-                int do_update = pending_update;
-                timer_active = 0;
-                pending_update = 0;
-                if (do_update) {
-                    LOG_INFO("SIGUSR1 timer expired, updating iptables rules...");
-                    perform_update();
-                }
+                g_commit_deadline = 0;
+                commit_run(&signals);
             }
         }
     }
