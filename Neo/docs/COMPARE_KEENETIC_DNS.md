@@ -299,15 +299,3 @@ geosite/geoip-категории и их регулярное обновлени
    `ip rule`, таблицы маршрутов и `iptables-save -t mangle`, сразу после —
    `interface <туннель> up`. Основной интернет-канал не затрагивался,
    связность проверялась ping до и после.
-
-Всё созданное удалено (`no object-group fqdn …` снимает и привязанные
-маршруты), `system configuration save` не вызывался — startup-config роутера
-не затронут. Итоговая проверка: групп 0, правил `OGDN` 0, число ipset вернулось
-к исходному, связность подтверждена ping.
-
-## 11. Источники
-
-- [DNS-based routes — Keenetic support](https://support.keenetic.com/explorer/kn-1613/en/51150-dns-based-routes.html)
-- [KeeneticOS 5.0 release notes](https://support.keenetic.com/starter/kn-1121/en/53102-os-5-0.html)
-- [keenetic-geosite-sync](https://github.com/yangirov/keenetic-geosite-sync)
-- [gokeenapi issue #20 — DNS routing support](https://github.com/Noksa/gokeenapi/issues/20)
