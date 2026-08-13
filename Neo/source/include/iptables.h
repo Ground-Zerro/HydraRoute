@@ -16,6 +16,8 @@ typedef struct {
 
 int apply_unified_connmark_rules(const unified_target_t *targets, int count,
                                  const config_t *cfg, const char *l7_wan);
+int iptables_fast_restore_cached(void);
+void iptables_fast_cache_clear(void);
 int cleanup_connmark_rules(const ipset_pair_t *pairs, int count);
 void iptables_delete_rules_matching(const char *ipt_cmd, const char *chain,
                                     const char *needle1, const char *needle2);

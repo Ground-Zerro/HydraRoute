@@ -6,7 +6,49 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
+
+#define MAX_CACHED_CONNMARK_TARGETS \
+    ((MAX_POLICY_ORDER + MAX_INTERFACES) * 2)
+
+typedef struct {
+    char ipset_name[64];
+    char mark_hex[16];
+    int family_index;
+    int global_routing;
+} cached_connmark_target_t;
+
+typedef struct {
+    cached_connmark_target_t targets[MAX_CACHED_CONNMARK_TARGETS];
+    int count;
+    int valid;
+} connmark_cache_t;
+
+static connmark_cache_t g_connmark_cache;
+
+static int cache_add_target(connmark_cache_t *cache, const char *ipset_name,
+                            const char *mark_hex, int family_index,
+                            int global_routing) {
+    if (!cache || !ipset_name || !mark_hex || cache->count < 0 ||
+        cache->count >= MAX_CACHED_CONNMARK_TARGETS)
+        return -1;
+
+    cached_connmark_target_t *target = &cache->targets[cache->count++];
+    strncpy(target->ipset_name, ipset_name, sizeof(target->ipset_name) - 1);
+    target->ipset_name[sizeof(target->ipset_name) - 1] = '\0';
+    strncpy(target->mark_hex, mark_hex, sizeof(target->mark_hex) - 1);
+    target->mark_hex[sizeof(target->mark_hex) - 1] = '\0';
+    target->family_index = family_index;
+    target->global_routing = global_routing;
+    return 0;
+}
+
+static long long monotonic_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
 
 static void get_br0_global_ipv6(char *ipv6_net, int ipv6_size) {
     ipv6_net[0] = '\0';
@@ -118,6 +160,8 @@ int apply_unified_connmark_rules(const unified_target_t *targets, int count,
     get_br0_global_ipv6(ipv6_net, sizeof(ipv6_net));
 
     char policy_marks[MAX_POLICY_ORDER + MAX_INTERFACES][16];
+    connmark_cache_t candidate;
+    memset(&candidate, 0, sizeof(candidate));
     int incomplete = 0;
 
     for (int i = 0; i < count; i++) {
@@ -172,8 +216,13 @@ int apply_unified_connmark_rules(const unified_target_t *targets, int count,
             connmark_rule_state_t state;
             if (connmark_rule_state(fam->dump, set_name, mark_hex, &state) != 0)
                 return -1;
-            if (state.exact_set_rule && !state.conflicting_set_rule) continue;
             if (fi == 1 && !targets[i].is_interface && ipv6_net[0] == '\0') continue;
+            if (cache_add_target(&candidate, set_name, mark_hex, fi,
+                                 cfg->global_routing) != 0) {
+                LOG_ERROR("Too many cached CONNMARK targets");
+                return -1;
+            }
+            if (state.exact_set_rule && !state.conflicting_set_rule) continue;
 
             if (state.conflicting_set_rule) {
                 char needle[128];
@@ -227,7 +276,128 @@ int apply_unified_connmark_rules(const unified_target_t *targets, int count,
         LOG_DEBUG("Committed %d rule groups via %s", fam->rule_count, fam->restore_cmd);
     }
 
-    return incomplete ? -1 : 0;
+    if (incomplete) return -1;
+
+    candidate.valid = 1;
+    g_connmark_cache = candidate;
+    return 0;
+}
+
+int iptables_fast_restore_cached(void) {
+    if (!g_connmark_cache.valid) {
+        LOG_DEBUG("Fast netfilter restore skipped: cache unavailable");
+        return 0;
+    }
+
+    long long started = monotonic_ms();
+    connmark_family_t fams[2] = {
+        { .ipt_cmd = "iptables",  .restore_cmd = "iptables-restore"  },
+        { .ipt_cmd = "ip6tables", .restore_cmd = "ip6tables-restore" },
+    };
+    int failed = 0;
+    int restored = 0;
+    int deferred = 0;
+
+    for (int fi = 0; fi < 2; fi++) {
+        connmark_family_t *fam = &fams[fi];
+        int family_failed = 0;
+        int represented = 0;
+        for (int i = 0; i < g_connmark_cache.count; i++) {
+            if (g_connmark_cache.targets[i].family_index == fi) {
+                represented = 1;
+                break;
+            }
+        }
+        if (!represented) continue;
+
+        char *argv[] = {(char *)fam->ipt_cmd, "-w", "-t", "mangle", "-S", NULL};
+        if (run_command_output(fam->ipt_cmd, argv, fam->dump, sizeof(fam->dump)) != 0) {
+            LOG_WARN("Fast netfilter restore: %s -t mangle -S failed", fam->ipt_cmd);
+            failed = 1;
+            continue;
+        }
+
+        for (int i = 0; i < g_connmark_cache.count; i++) {
+            cached_connmark_target_t *target = &g_connmark_cache.targets[i];
+            if (target->family_index != fi) continue;
+
+            connmark_rule_state_t state;
+            if (connmark_rule_state(fam->dump, target->ipset_name,
+                                    target->mark_hex, &state) != 0) {
+                LOG_WARN("Fast netfilter restore: invalid %s ruleset", fam->ipt_cmd);
+                family_failed = 1;
+                failed = 1;
+                break;
+            }
+
+            connmark_restore_action_t action = connmark_restore_action(&state);
+            if (action == CONNMARK_RESTORE_DEFER) {
+                deferred++;
+                continue;
+            }
+            if (action == CONNMARK_RESTORE_NONE) continue;
+
+            if (fam->off == 0 && batch_append(fam, "*mangle\n") != 0) {
+                family_failed = 1;
+                failed = 1;
+                break;
+            }
+
+            char rule[512];
+            if (action == CONNMARK_RESTORE_PAIR) {
+                const char *packet_condition = target->global_routing
+                    ? "" : "-m mark ! --mark 0xffffaa0/0xffffff0 ";
+                if (connmark_format_set_rule(rule, sizeof(rule), packet_condition,
+                                              target->ipset_name,
+                                              target->mark_hex) != 0 ||
+                    batch_append(fam, "%s", rule) != 0 ||
+                    connmark_format_restore_rule(rule, sizeof(rule),
+                                                 target->ipset_name) != 0 ||
+                    batch_append(fam, "%s", rule) != 0) {
+                    family_failed = 1;
+                    failed = 1;
+                    break;
+                }
+            } else if (action == CONNMARK_RESTORE_ONLY) {
+                if (connmark_format_restore_rule(rule, sizeof(rule),
+                                                 target->ipset_name) != 0 ||
+                    batch_append(fam, "%s", rule) != 0) {
+                    family_failed = 1;
+                    failed = 1;
+                    break;
+                }
+            }
+            fam->rule_count++;
+        }
+
+        if (family_failed || fam->rule_count == 0) continue;
+        if (batch_append(fam, "COMMIT\n") != 0) {
+            family_failed = 1;
+            failed = 1;
+            continue;
+        }
+
+        char *restore_argv[] = {(char *)fam->restore_cmd, "--noflush", NULL};
+        int ret = run_command_stdin(fam->restore_cmd, restore_argv,
+                                     fam->batch, fam->off);
+        if (ret != 0) {
+            LOG_WARN("Fast netfilter restore: %s failed (exit %d)",
+                     fam->restore_cmd, ret);
+            failed = 1;
+            continue;
+        }
+        restored += fam->rule_count;
+    }
+
+    if (deferred > 0)
+        LOG_DEBUG("Fast netfilter restore deferred %d conflicting rule groups", deferred);
+    LOG_DEBUG("Fast netfilter restore repaired %d rule groups in %lld ms",
+              restored, monotonic_ms() - started);
+    return failed ? -1 : restored;
+}
+
+void iptables_fast_cache_clear(void) {
+    memset(&g_connmark_cache, 0, sizeof(g_connmark_cache));
 }
 
 int cleanup_connmark_rules(const ipset_pair_t *pairs, int count) {

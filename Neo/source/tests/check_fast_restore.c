@@ -64,6 +64,28 @@ static int check_renderers(void) {
     return 0;
 }
 
+static int check_restore_actions(void) {
+    static const struct {
+        const char *name;
+        connmark_rule_state_t state;
+        connmark_restore_action_t expected;
+    } cases[] = {
+        {"action-pair", {0, 0, 0}, CONNMARK_RESTORE_PAIR},
+        {"action-restore-only", {1, 0, 0}, CONNMARK_RESTORE_ONLY},
+        {"action-none", {1, 1, 0}, CONNMARK_RESTORE_NONE},
+        {"action-conflict", {0, 0, 1}, CONNMARK_RESTORE_DEFER},
+        {"action-restore-before-set", {0, 1, 0}, CONNMARK_RESTORE_DEFER},
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        if (connmark_restore_action(&cases[i].state) != cases[i].expected) {
+            fprintf(stderr, "%s\n", cases[i].name);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int main(void) {
     if (check_state("empty-state", empty_dump, "nwg0", "3001", 0, 0, 0) != 0)
         return 1;
@@ -78,6 +100,8 @@ int main(void) {
     if (check_state("exact-set-name", conflicting_pair, "nwg01", "3001", 0, 0, 0) != 0)
         return 1;
     if (check_renderers() != 0)
+        return 1;
+    if (check_restore_actions() != 0)
         return 1;
 
     puts("check_fast_restore: ok");

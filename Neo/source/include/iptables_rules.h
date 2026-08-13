@@ -24,4 +24,14 @@ int connmark_format_restore_rule(char *out,
                                  size_t out_size,
                                  const char *ipset_name);
 
+typedef enum {
+    CONNMARK_RESTORE_NONE = 0,
+    CONNMARK_RESTORE_PAIR,
+    CONNMARK_RESTORE_ONLY,
+    CONNMARK_RESTORE_DEFER
+} connmark_restore_action_t;
+
+connmark_restore_action_t
+connmark_restore_action(const connmark_rule_state_t *state);
+
 #endif

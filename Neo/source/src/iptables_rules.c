@@ -184,3 +184,16 @@ int connmark_format_restore_rule(char *out,
     if (n < 0 || (size_t)n >= out_size) return -1;
     return 0;
 }
+
+connmark_restore_action_t
+connmark_restore_action(const connmark_rule_state_t *state) {
+    if (!state || state->conflicting_set_rule)
+        return CONNMARK_RESTORE_DEFER;
+    if (state->restore_rule && !state->exact_set_rule)
+        return CONNMARK_RESTORE_DEFER;
+    if (state->exact_set_rule && state->restore_rule)
+        return CONNMARK_RESTORE_NONE;
+    if (state->exact_set_rule)
+        return CONNMARK_RESTORE_ONLY;
+    return CONNMARK_RESTORE_PAIR;
+}
