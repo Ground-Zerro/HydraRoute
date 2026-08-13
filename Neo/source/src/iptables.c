@@ -213,19 +213,20 @@ int apply_unified_connmark_rules(const unified_target_t *targets, int count,
             connmark_family_t *fam = &fams[fi];
             const char *set_name = (fi == 0) ? targets[i].pair.ipv4 : targets[i].pair.ipv6;
 
+            if (fi == 1 && !targets[i].is_interface && ipv6_net[0] == '\0') continue;
+
             connmark_rule_state_t state;
             if (connmark_rule_state(fam->dump, set_name, mark_hex, &state) != 0)
                 return -1;
-            if (fi == 1 && !targets[i].is_interface && ipv6_net[0] == '\0') continue;
             if (cache_add_target(&candidate, set_name, mark_hex, fi,
                                  cfg->global_routing) != 0) {
                 LOG_ERROR("Too many cached CONNMARK targets");
                 return -1;
             }
-            if (state.exact_set_rule && !state.conflicting_set_rule) continue;
+            connmark_restore_action_t action = connmark_restore_action(&state);
+            if (action == CONNMARK_RESTORE_NONE) continue;
 
-            if (state.conflicting_set_rule ||
-                (state.restore_rule && !state.exact_set_rule)) {
+            if (action == CONNMARK_RESTORE_DEFER) {
                 char needle[128];
                 snprintf(needle, sizeof(needle), "--match-set %s ", set_name);
                 if (state.conflicting_set_rule)
@@ -233,13 +234,16 @@ int apply_unified_connmark_rules(const unified_target_t *targets, int count,
                 else
                     LOG_INFO("Incomplete CONNMARK pair for %s, recreating", set_name);
                 iptables_delete_rules_matching(fam->ipt_cmd, "PREROUTING", needle, NULL);
+                action = CONNMARK_RESTORE_PAIR;
             }
 
             char rule[512];
-            if (connmark_format_set_rule(rule, sizeof(rule), pkt_cond,
-                                          set_name, mark_hex) != 0 ||
-                batch_append(fam, "%s", rule) != 0)
-                return -1;
+            if (action == CONNMARK_RESTORE_PAIR) {
+                if (connmark_format_set_rule(rule, sizeof(rule), pkt_cond,
+                                              set_name, mark_hex) != 0 ||
+                    batch_append(fam, "%s", rule) != 0)
+                    return -1;
+            }
             if (connmark_format_restore_rule(rule, sizeof(rule), set_name) != 0 ||
                 batch_append(fam, "%s", rule) != 0)
                 return -1;
