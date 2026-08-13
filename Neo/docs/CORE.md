@@ -1,6 +1,6 @@
 # HRNeo — техническая документация кодовой базы
 
-Исходный код HRNeo (HydraRoute Neo) v3.17.0-1: архитектура, модули, потоки данных, оптимизации.
+Исходный код HRNeo (HydraRoute Neo) v3.17.1-1: архитектура, модули, потоки данных, оптимизации.
 
 ---
 
@@ -72,7 +72,8 @@ HRNeo — демон для policy routing на роутерах Keenetic (Entwa
 16. Если `ConntrackFlush=true` И IP добавлен в `ipset` впервые (`NLM_F_EXCL` вернул `err==0`, а не `IPSET_ERR_EXIST`), IP попадает в pending-буфер `conntrack_flush_request` — conntrack-DUMP выполняется **асинхронно**: неблокирующий сокет `m->fd` зарегистрирован в том же epoll, чанки таблицы читаются между DNS-пакетами, DELETE по совпадению dst-IP уходит fire-and-forget. DNS-события никогда не ждут сканирования таблицы (при burst-резолвах ipset add всех доменов завершается до/независимо от DUMP'а), один DUMP обслуживает все накопленные IP. Реальное удаление происходит только при наличии активной `conntrack`-записи к IP; если соединения ещё нет — DUMP проходит вхолостую.
 
 17. Обрабатываются сигналы:
-    - `SIGUSR1` — обновление состояния интерфейсов + пересоздание `CONNMARK`-правил (включая повторный `GET /rci/show/ip/policy/` для возможно изменившихся `markID`) + реинсталл L7-правил (idempotent через `iptables -C`). Debounce 5с через `timerfd`
+    - `SIGUSR1` — debounced авторитетная синхронизация: обновление состояния интерфейсов, повторный `GET /rci/show/ip/policy/` для возможно изменившихся `markID`, пересоздание `CONNMARK`-правил и реинсталл L7-правил. Окно debounce — 2000 мс, жёсткий потолок откладывания — 10000 мс; таймер используется через `timerfd`
+    - `SIGUSR2` — capability-gated fast restore после перестроения mangle: event loop синхронно добавляет только отсутствующие пары из in-memory last-known-good cache без RCI, затем безусловно ставит тот же debounced авторитетный commit. Хук выбирает `SIGUSR2` только при точном совпадении PID capability marker с `/var/run/hrneo.pid`, иначе отправляет `SIGUSR1`
     - `SIGINT`/`SIGTERM` — штатная остановка: снятие L7 `NFLOG`-правил, удаление `CONNMARK`, удаление `ip rule` + flush таблиц DirectRoute, закрытие netlink-сокетов, удаление PID-файла
 
 ### Архитектурная схема (DNS-канал)
@@ -209,7 +210,7 @@ int                     g_reasm_active;
    - `--genconfig [path]`: `return 3 → main` вызывает `config_generate(args.genconfig_target)`
    - `--keenetic <token>`: `return 4 → main` вызывает `config_set_keenetic_token(cfg_path, args.keenetic_token)`
    - ошибка: `return -1 → 1`
-2. `sigprocmask(SIG_BLOCK)` для `SIGINT`/`SIGTERM`/`SIGUSR1`
+2. `sigprocmask(SIG_BLOCK)` для `SIGINT`/`SIGTERM`/`SIGUSR1`/`SIGUSR2`
 3. `config_read()` — путь из `args.config_path` или `DEFAULT_CONFIG_PATH`; явный `--config` при недоступном файле → выход 1
 4. `args_apply()` — наложение CLI-флагов (только `set_mask`-биты)
 5. Если `!auto_start` → `return 0`
@@ -230,7 +231,7 @@ int                     g_reasm_active;
 19. Если `conntrack_flush` — `conntrack_mgr_init()` (при ошибке flush отключается)
 20. `pkt_capture_init()` — два `AF_PACKET SOCK_DGRAM/ETH_P_ALL` сокета (`fd4`, `fd6`)
 21. Если `l7_capture_enabled`: `l7_firewall_resolve_wan` (при неудаче — L7 отключается с `LOG_WARN`, DNS-only); `l7_firewall_load_nflog_modules` (`nfnetlink_log`+`xt_NFLOG` через `init_module(2)`; при неудаче — L7 отключается, DNS-only, **без fallback**). Иначе: `l7_firewall_load_kmod("xt_connbytes")`; `l7_dispatch_set_enable` (с флагами tls/http/quic); при `l7_tcp_reasm_enabled` — `tcp_reasm_init` + `l7_dispatch_set_reasm` (`g_reasm_active=1`); `nflog_capture_init` → `g_l7_active=1`. Правила NFLOG **не ставятся здесь** — они входят в общий batch коммитера (шаг 24)
-22. `signal_mgr_init()` — `sigprocmask` + `signalfd` + `timerfd`
+22. `signal_mgr_init()` — `sigprocmask` + `signalfd` + `timerfd`; после инициализации публикуется capability marker `/var/run/hrneo.netfilter-sigusr2` с PID демона (ошибка marker не отключает авторитетную синхронизацию)
 23. `epoll_create1()` — регистрация `cap.fd4`, `cap.fd6`, `signals.sig_fd`, `signals.timer_fd`; при активном conntrack flush — `g_conntrack.fd` (async DUMP); при `g_l7_active` — `nflog_fd`; при `g_reasm_active` — `reasm_gc_fd` (`timerfd` 1s)
 24. `commit_run()` — первый коммит netfilter (тот же путь, что и по SIGUSR1, с тем же backoff-ретраем)
 25. Основной цикл `epoll_wait` (`events[8]`)
@@ -666,7 +667,15 @@ NDMS (см. `NETFILTER_RACE.md`): накапливать вызовы `netfilter
 **`SIGUSR1`:** `g_commit_retry=0`; таймер взводится на
 `signal_mgr_debounce_delay(now, g_commit_deadline, NF_COMMIT_DEBOUNCE_MS)`.
 Никакой работы в обработчике — каждый новый сигнал только сдвигает окно, пачка
-из N хуков даёт ровно один коммит.
+из N хуков даёт ровно один авторитетный коммит. Значения источника: окно
+тишины `NF_COMMIT_DEBOUNCE_MS=2000`, потолок `NF_COMMIT_MAX_DEFER_MS=10000`.
+
+**`SIGUSR2`:** fast restore выполняется синхронно в event loop до постановки
+таймера. Кэш содержит только последнюю полностью успешную IPv4/IPv6 генерацию;
+добавляются лишь отсутствующие точные `CONNMARK`-правила, конфликтующая метка
+не перезаписывается. Ошибка dump/restore логируется, но затем всё равно
+вызывается тот же scheduler, что и для `SIGUSR1`; RCI и маршруты остаются
+ответственностью авторитетного commit.
 
 `g_commit_deadline` (0 = ничего не отложено) ставится первым сигналом пачки в
 `now + NF_COMMIT_MAX_DEFER_MS` и обнуляется при срабатывании таймера. Без этого
@@ -1056,7 +1065,7 @@ GET /rci/show/ip/policy/NoSuch/mark      →  HTTP 404
 
 ## 16. Система сборки: Makefile
 
-**Версия:** 3.17.0-1
+**Версия:** 3.17.1-1
 **Язык:** C (без CGO, без внешних библиотек)
 
 ### Кросс-компиляция
@@ -1093,7 +1102,7 @@ GET /rci/show/ip/policy/NoSuch/mark      →  HTTP 404
 ## 17. Интеграция с Keenetic (сборка IPK)
 
 - **Init-скрипт:** `/opt/etc/init.d/S99hrneo` — стандартный Entware init (`rc.func`), `ENABLED=yes`, `PROCS=hrneo`, `PIDFILE=/var/run/hrneo.pid`
-- **Netfilter hook:** `/opt/etc/ndm/netfilter.d/015-hrneo.sh` — тонкий хук: читает `/var/run/hrneo.pid`; если процесс живёт в `/proc` — `kill -USR1`
+- **Netfilter hook:** `/opt/etc/ndm/netfilter.d/015-hrneo.sh` — читает `/var/run/hrneo.pid` и capability marker `/var/run/hrneo.netfilter-sigusr2`; `SIGUSR2` отправляется только при непустом числовом marker с PID, точно равным PID-файлу и живым `/proc/$pid`, во всех остальных случаях используется безопасный fallback `SIGUSR1`
 - **Symlink:** `/opt/bin/neo` → `/opt/etc/init.d/S99hrneo` (создаётся в `postinst`)
 - **postinst:** вставляет `[ $ACTION = start ] && sleep 10` в `rc.unslung` перед запуском, чтобы дать Keenetic поднять интерфейсы (извините, но это решает кучу проблем в т.ч. для другого софта...)
 - **UPX:** не применяется ни к одной архитектуре — снижение ложных срабатываний антивирусов (UPX поверх static-stripped ELF — главный триггер эвристик Mirai/Gafgyt).
@@ -1195,7 +1204,7 @@ NFQUEUE-десинхронизаторов (zapret2/nfqws2/tpws) — они ра
 - **Суффиксный матчинг через хеш-таблицу.** Для каждой точки в домене проверяется parent-домен — `O(количество точек)`, каждая `O(1)` средний.
 - **Кэш ipset-списков и единый timeout.** `set_names[]` (cache `ipset list -n` при старте) + одно поле `default_timeout` менеджера (timeout одинаков для всех сетов) — в `ipset_add_batch` нет ни хеширования имени, ни риска коллизий.
 - **Общий open-addressed FNV-1a индекс.** `name_index_t` в `geodat` для `batches[]` и `usage[]` (`NAME_INDEX_SLOTS=256`, доступ к имени через `name_at_fn`) — заменяет `O(n)` линейный поиск при большом числе целей.
-- **Debounce SIGUSR1.** `timerfd`: повторный `SIGUSR1` во время обработки откладывается на 5 секунд.
+- **Debounce и fast restore сигналов.** `SIGUSR1` использует `timerfd` с окном 2000 мс и потолком 10000 мс; `SIGUSR2` сначала восстанавливает отсутствующие кэшированные `CONNMARK`-пары, затем запускает тот же debounced авторитетный commit.
 - **Асинхронный conntrack flush через netlink.** Два long-lived netlink-сокета (init однократно): неблокирующий `fd` для DUMP-потока (в epoll, чанки читаются между DNS-пакетами) + `del_fd` для DELETE fire-and-forget (без `NLM_F_ACK`). Новые IP коалесцируются в pending-буфер — один DUMP на burst вместо DUMP на каждый DNS-ответ, event loop не блокируется на сканировании таблицы. Без `fork`/`exec`.
 - **Стриминговый парсинг .dat-файлов.** Потоковое чтение через `setvbuf(64KB)`. В памяти хранятся только извлечённые записи. Visitor-pattern (`scan_dat_file`).
 - **Статическая аллокация в hot path.** `dns_result_t` (static в `process_dns_packet`), `processed[]`, `ipv4_batch[]`, `ipv6_batch[]`, `all_new[]` — на стеке, без `malloc`. CNAME-записи передаются в матчер как `dns_cname_t` напрямую из результата парсинга — промежуточного копирования на каждый DNS-ответ нет.
@@ -1210,7 +1219,7 @@ NFQUEUE-десинхронизаторов (zapret2/nfqws2/tpws) — они ра
 
 ## Резюме
 
-**HRNeo v3.17.0-1** — компактный однопоточный policy routing демон для роутеров Keenetic, написанный на чистом C.
+**HRNeo v3.17.1-1** — компактный однопоточный policy routing демон для роутеров Keenetic, написанный на чистом C.
 
 Два источника имён хостов:
 

@@ -2,7 +2,7 @@
 
 Справочник по параметрам конфигурационного файла `hrneo.conf`, CLI-флагам и формату вспомогательных файлов (`domain.conf`, `ip.list`).
 
-**Версия кода:** hrneo 3.17.0-1
+**Версия кода:** hrneo 3.17.1-1
 
 ---
 
@@ -479,8 +479,18 @@ GET /rci/show/ip/policy/HydraRoute/mark HTTP/1.0
 - пересоздаёт `CONNMARK`-правила в `mangle/PREROUTING` на текущей конфигурации в памяти (config, watchlist и GeoSite не перечитываются)
 - обновляет состояние интерфейсов (`up`/`down`) для DirectRoute и корректирует маршруты
 - если `l7CaptureEnabled=true` и L7-перехват успешно стартовал — заново ставит `NFLOG`-правила для портов 80/443 на WAN-интерфейс в `mangle/FORWARD`+`OUTPUT` (idempotent через `iptables -C`); при `l7CaptureEnabled=false` шаг пропускается
-- **debounce:** повторный `SIGUSR1` во время обработки предыдущего откладывается на 5 секунд
+- **debounce:** повторный `SIGUSR1` сдвигает окно тишины на 2000 мс; непрерывный поток сигналов ограничен потолком откладывания 10000 мс
 - отправляется автоматически хуком `/opt/etc/ndm/netfilter.d/015-hrneo.sh` при изменении `mangle`-таблицы роутером Keenetic
+
+### `SIGUSR2`
+
+Capability-gated быстрое восстановление firewall после перестроения `mangle`-таблицы NDMS.
+
+- хук сначала проверяет `/var/run/hrneo.pid` и живой `/proc/$pid`, затем читает `/var/run/hrneo.netfilter-sigusr2`; `SIGUSR2` отправляется только при точном совпадении двух числовых PID
+- отсутствующий, пустой, malformed или stale marker, а также marker другого PID, безопасно выбирают fallback `SIGUSR1` для совместимости со старым демоном
+- daemon в event loop сначала выполняет один dump и batch на каждое представленное семейство, добавляя только отсутствующие точные пары `CONNMARK` из in-memory last-known-good cache; другую live mark fast path не перезаписывает
+- после fast restore всегда планируется тот же debounced авторитетный commit: он заново читает актуальные `markID` через RCI, исправляет конфликты и обновляет кэш только после полной успешной IPv4/IPv6 apply
+- при отсутствии кэша fast restore пропускается; при ошибке dump/restore normal authoritative retry всё равно планируется
 
 ### `SIGTERM` / `SIGINT`
 
