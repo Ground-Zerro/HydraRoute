@@ -224,10 +224,14 @@ int apply_unified_connmark_rules(const unified_target_t *targets, int count,
             }
             if (state.exact_set_rule && !state.conflicting_set_rule) continue;
 
-            if (state.conflicting_set_rule) {
+            if (state.conflicting_set_rule ||
+                (state.restore_rule && !state.exact_set_rule)) {
                 char needle[128];
                 snprintf(needle, sizeof(needle), "--match-set %s ", set_name);
-                LOG_INFO("Mark changed for %s -> %s, recreating", set_name, mark_hex);
+                if (state.conflicting_set_rule)
+                    LOG_INFO("Mark changed for %s -> %s, recreating", set_name, mark_hex);
+                else
+                    LOG_INFO("Incomplete CONNMARK pair for %s, recreating", set_name);
                 iptables_delete_rules_matching(fam->ipt_cmd, "PREROUTING", needle, NULL);
             }
 
