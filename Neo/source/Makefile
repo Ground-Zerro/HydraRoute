@@ -31,7 +31,9 @@ LDFLAGS_DYNAMIC = $(COMMON_LDFLAGS)
 
 LIBS =
 
-SRCS = src/main.c src/util.c src/log.c src/config.c src/args.c src/params.c src/watchlist.c src/ipset_nl.c src/dns.c src/packet_capture.c src/iptables.c src/signal_handler.c src/rci.c src/conntrack.c src/geodat.c src/routing.c src/probe_tls.c src/probe_http.c src/probe_quic.c src/quic_crypto.c src/bogon.c src/nflog_capture.c src/l7_dispatch.c src/l7_firewall.c src/tcp_reasm.c
+SRCS = src/main.c src/util.c src/log.c src/config.c src/args.c src/params.c src/watchlist.c src/ipset_nl.c src/dns.c src/packet_capture.c src/iptables.c src/iptables_rules.c src/signal_handler.c src/rci.c src/conntrack.c src/geodat.c src/routing.c src/probe_tls.c src/probe_http.c src/probe_quic.c src/quic_crypto.c src/bogon.c src/nflog_capture.c src/l7_dispatch.c src/l7_firewall.c src/tcp_reasm.c
+
+CHECK_FAST_SRCS := tests/check_fast_restore.c src/iptables_rules.c
 
 .PHONY: all clean mipsel mips aarch64 native check
 
@@ -73,10 +75,12 @@ build/$(PROJECT)-aarch64: $(SRCS)
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(SRCS) -o $@ $(LDFLAGS) $(LIBS)
 
-check:
+check: build/check_fast_restore
+	./build/check_fast_restore
+
+build/check_fast_restore: $(CHECK_FAST_SRCS)
 	@mkdir -p build
-	$(CC_NATIVE) $(CFLAGS_NATIVE) tests/check_nf.c src/l7_firewall.c src/util.c src/log.c src/signal_handler.c -o build/check_nf
-	./build/check_nf
+	$(CC_NATIVE) $(CFLAGS_NATIVE) $(CHECK_FAST_SRCS) -o $@
 
 clean:
 	rm -rf build/

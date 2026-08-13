@@ -1,4 +1,5 @@
 #include "../include/iptables.h"
+#include "../include/iptables_rules.h"
 #include "../include/l7_firewall.h"
 #include "../include/log.h"
 #include "../include/util.h"
@@ -31,37 +32,6 @@ static void get_br0_global_ipv6(char *ipv6_net, int ipv6_size) {
         }
         line = strtok_r(NULL, "\n", &saveptr);
     }
-}
-
-static const char *find_mark_in_rules(const char *dump, const char *ipset_name) {
-    static char mark_buf[16];
-    char match_pattern[128];
-    snprintf(match_pattern, sizeof(match_pattern), "--match-set %s dst", ipset_name);
-
-    const char *line = dump;
-    while (line && *line) {
-        const char *nl = strchr(line, '\n');
-        size_t len = nl ? (size_t)(nl - line) : strlen(line);
-
-        if (line_find(line, len, "-A PREROUTING ") == line &&
-            line_find(line, len, match_pattern)) {
-            const char *xmark = line_find(line, len, "--set-xmark ");
-            if (xmark) {
-                xmark += 12;
-                if (xmark[0] == '0' && (xmark[1] == 'x' || xmark[1] == 'X'))
-                    xmark += 2;
-                const char *slash = line_find(xmark, len - (size_t)(xmark - line), "/");
-                size_t mlen = slash ? (size_t)(slash - xmark) : 0;
-                if (mlen > 0 && mlen < sizeof(mark_buf)) {
-                    memcpy(mark_buf, xmark, mlen);
-                    mark_buf[mlen] = '\0';
-                    return mark_buf;
-                }
-            }
-        }
-        line = nl ? nl + 1 : NULL;
-    }
-    return NULL;
 }
 
 void iptables_delete_rules_matching(const char *ipt_cmd, const char *chain,
@@ -199,24 +169,27 @@ int apply_unified_connmark_rules(const unified_target_t *targets, int count,
             connmark_family_t *fam = &fams[fi];
             const char *set_name = (fi == 0) ? targets[i].pair.ipv4 : targets[i].pair.ipv6;
 
-            const char *current_mark = find_mark_in_rules(fam->dump, set_name);
-            if (current_mark && strcmp(current_mark, mark_hex) == 0) continue;
+            connmark_rule_state_t state;
+            if (connmark_rule_state(fam->dump, set_name, mark_hex, &state) != 0)
+                return -1;
+            if (state.exact_set_rule && !state.conflicting_set_rule) continue;
             if (fi == 1 && !targets[i].is_interface && ipv6_net[0] == '\0') continue;
 
-            if (current_mark) {
+            if (state.conflicting_set_rule) {
                 char needle[128];
                 snprintf(needle, sizeof(needle), "--match-set %s ", set_name);
-                LOG_INFO("Mark changed for %s: %s -> %s, recreating",
-                         set_name, current_mark, mark_hex);
+                LOG_INFO("Mark changed for %s -> %s, recreating", set_name, mark_hex);
                 iptables_delete_rules_matching(fam->ipt_cmd, "PREROUTING", needle, NULL);
             }
 
-            if (batch_append(fam,
-                    "-A PREROUTING %s-m connmark --mark 0x0/0xffffffff -m set --match-set %s dst -j CONNMARK --set-xmark 0x%s/0xffffffff\n",
-                    pkt_cond, set_name, mark_hex) != 0) return -1;
-            if (batch_append(fam,
-                    "-A PREROUTING -m set --match-set %s dst -j CONNMARK --restore-mark --nfmask 0xffffffff --ctmask 0xffffffff\n",
-                    set_name) != 0) return -1;
+            char rule[512];
+            if (connmark_format_set_rule(rule, sizeof(rule), pkt_cond,
+                                          set_name, mark_hex) != 0 ||
+                batch_append(fam, "%s", rule) != 0)
+                return -1;
+            if (connmark_format_restore_rule(rule, sizeof(rule), set_name) != 0 ||
+                batch_append(fam, "%s", rule) != 0)
+                return -1;
             fam->rule_count++;
             LOG_INFO("Adding rules for %s (mark: 0x%s) via %s",
                      set_name, mark_hex, fam->restore_cmd);
