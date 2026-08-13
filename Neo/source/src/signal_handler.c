@@ -16,6 +16,7 @@ int signal_mgr_init(signal_mgr_t *m) {
     sigaddset(&mask, SIGINT);
     sigaddset(&mask, SIGTERM);
     sigaddset(&mask, SIGUSR1);
+    sigaddset(&mask, SIGUSR2);
 
     if (sigprocmask(SIG_BLOCK, &mask, NULL) < 0) {
         LOG_ERROR("sigprocmask failed");

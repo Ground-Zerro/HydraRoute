@@ -24,6 +24,7 @@
 #include <sys/stat.h>
 #include <sys/epoll.h>
 #include <sys/signalfd.h>
+#include <fcntl.h>
 #include <errno.h>
 #include <signal.h>
 #include <netinet/in.h>
@@ -45,6 +46,8 @@ static tcp_reasm_t g_reasm;
 static int g_reasm_active;
 static int g_commit_retry;
 static long long g_commit_deadline;
+
+#define NETFILTER_SIGUSR2_MARKER "/var/run/hrneo.netfilter-sigusr2"
 
 static int create_pid_file(const char *path) {
     FILE *f = fopen(path, "r");
@@ -82,6 +85,30 @@ static void remove_pid_file(const char *path) {
     if (unlink(path) != 0 && errno != ENOENT) {
         LOG_WARN("PID file remove error: %s", strerror(errno));
     }
+}
+
+static int publish_sigusr2_marker(const char *path) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) return -1;
+
+    char pid_buf[32];
+    int len = snprintf(pid_buf, sizeof(pid_buf), "%d\n", (int)getpid());
+    ssize_t written = (len > 0) ? write(fd, pid_buf, (size_t)len) : -1;
+    int close_result = close(fd);
+    if (written != len || close_result != 0) {
+        unlink(path);
+        return -1;
+    }
+    if (chmod(path, 0644) != 0) {
+        unlink(path);
+        return -1;
+    }
+    return 0;
+}
+
+static void remove_sigusr2_marker(const char *path) {
+    if (unlink(path) != 0 && errno != ENOENT)
+        LOG_WARN("Capability marker remove error: %s", strerror(errno));
 }
 
 static int initialize_ipsets(ipset_manager_t *mgr, const ipset_pair_t *pairs, int count,
@@ -275,6 +302,17 @@ static void commit_run(signal_mgr_t *m) {
     signal_mgr_arm_timer(m, (int)delay);
 }
 
+static void schedule_commit(signal_mgr_t *m, const char *signal_label) {
+    long long now = signal_mgr_now_ms();
+    if (g_commit_deadline == 0)
+        g_commit_deadline = now + NF_COMMIT_MAX_DEFER_MS;
+    int delay = signal_mgr_debounce_delay(now, g_commit_deadline,
+                                          NF_COMMIT_DEBOUNCE_MS);
+    LOG_DEBUG("%s received, commit in %d ms", signal_label, delay);
+    g_commit_retry = 0;
+    signal_mgr_arm_timer(m, delay);
+}
+
 static void add_unique_name(char names[][64], int *count, const char *name, int max) {
     for (int i = 0; i < *count; i++) {
         if (strcmp(names[i], name) == 0) return;
@@ -320,6 +358,7 @@ int main(int argc, char *argv[]) {
         sigaddset(&mask, SIGINT);
         sigaddset(&mask, SIGTERM);
         sigaddset(&mask, SIGUSR1);
+        sigaddset(&mask, SIGUSR2);
         sigprocmask(SIG_BLOCK, &mask, NULL);
     }
 
@@ -553,9 +592,16 @@ int main(int argc, char *argv[]) {
     }
 
     signal_mgr_t signals;
+    int sigusr2_marker_published = 0;
     if (signal_mgr_init(&signals) != 0) {
         LOG_ERROR("Failed to init signal manager");
         goto cleanup_capture;
+    }
+
+    if (publish_sigusr2_marker(NETFILTER_SIGUSR2_MARKER) != 0) {
+        LOG_WARN("Cannot publish SIGUSR2 capability marker: %s", strerror(errno));
+    } else {
+        sigusr2_marker_published = 1;
     }
 
     int epfd = epoll_create1(EPOLL_CLOEXEC);
@@ -636,14 +682,15 @@ int main(int argc, char *argv[]) {
                         LOG_INFO("Received signal %d, shutting down...", si.ssi_signo);
                         g_shutdown = 1;
                     } else if (si.ssi_signo == SIGUSR1) {
-                        long long now = signal_mgr_now_ms();
-                        if (g_commit_deadline == 0)
-                            g_commit_deadline = now + NF_COMMIT_MAX_DEFER_MS;
-                        int delay = signal_mgr_debounce_delay(now, g_commit_deadline,
-                                                              NF_COMMIT_DEBOUNCE_MS);
-                        LOG_DEBUG("SIGUSR1 received, commit in %d ms", delay);
-                        g_commit_retry = 0;
-                        signal_mgr_arm_timer(&signals, delay);
+                        schedule_commit(&signals, "SIGUSR1");
+                    } else if (si.ssi_signo == SIGUSR2) {
+                        int restored = iptables_fast_restore_cached();
+                        if (restored < 0)
+                            LOG_WARN("SIGUSR2 fast netfilter restore failed");
+                        else
+                            LOG_DEBUG("SIGUSR2 fast netfilter restore repaired %d rule groups",
+                                      restored);
+                        schedule_commit(&signals, "SIGUSR2");
                     }
                 }
             } else if (events[i].data.fd == signals.timer_fd) {
@@ -659,6 +706,9 @@ int main(int argc, char *argv[]) {
 
 cleanup_signals:
     signal_mgr_close(&signals);
+    if (sigusr2_marker_published)
+        remove_sigusr2_marker(NETFILTER_SIGUSR2_MARKER);
+    iptables_fast_cache_clear();
 
 cleanup_capture:
     if (g_l7_active) {
