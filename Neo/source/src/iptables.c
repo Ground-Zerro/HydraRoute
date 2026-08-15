@@ -216,7 +216,8 @@ int apply_unified_connmark_rules(const unified_target_t *targets, int count,
             if (fi == 1 && !targets[i].is_interface && ipv6_net[0] == '\0') continue;
 
             connmark_rule_state_t state;
-            if (connmark_rule_state(fam->dump, set_name, mark_hex, &state) != 0)
+            if (connmark_rule_state_for_condition(fam->dump, set_name, mark_hex,
+                                                  pkt_cond, &state) != 0)
                 return -1;
             if (cache_add_target(&candidate, set_name, mark_hex, fi,
                                  cfg->global_routing) != 0) {
@@ -325,13 +326,44 @@ int iptables_fast_restore_cached(void) {
             continue;
         }
 
+        connmark_restore_target_t family_targets[MAX_CACHED_CONNMARK_TARGETS];
+        int family_target_count = 0;
+        for (int i = 0; i < g_connmark_cache.count; i++) {
+            cached_connmark_target_t *target = &g_connmark_cache.targets[i];
+            if (target->family_index != fi) continue;
+            family_targets[family_target_count++] = (connmark_restore_target_t){
+                .ipset_name = target->ipset_name,
+                .mark_hex = target->mark_hex,
+                .packet_condition = target->global_routing
+                    ? "" : "-m mark ! --mark 0xffffaa0/0xffffff0 ",
+            };
+        }
+
+        int order_result = connmark_restore_order_safe(
+            fam->dump, family_targets, (size_t)family_target_count);
+        if (order_result < 0) {
+            LOG_WARN("Fast netfilter restore: invalid %s ruleset", fam->ipt_cmd);
+            failed = 1;
+            continue;
+        }
+        if (order_result > 0) {
+            deferred += family_target_count;
+            LOG_DEBUG("Fast netfilter restore deferred %s to preserve policy order",
+                      fam->ipt_cmd);
+            continue;
+        }
+
+        int family_deferred = 0;
         for (int i = 0; i < g_connmark_cache.count; i++) {
             cached_connmark_target_t *target = &g_connmark_cache.targets[i];
             if (target->family_index != fi) continue;
 
             connmark_rule_state_t state;
-            if (connmark_rule_state(fam->dump, target->ipset_name,
-                                    target->mark_hex, &state) != 0) {
+            const char *packet_condition = target->global_routing
+                ? "" : "-m mark ! --mark 0xffffaa0/0xffffff0 ";
+            if (connmark_rule_state_for_condition(
+                    fam->dump, target->ipset_name, target->mark_hex,
+                    packet_condition, &state) != 0) {
                 LOG_WARN("Fast netfilter restore: invalid %s ruleset", fam->ipt_cmd);
                 family_failed = 1;
                 failed = 1;
@@ -340,8 +372,8 @@ int iptables_fast_restore_cached(void) {
 
             connmark_restore_action_t action = connmark_restore_action(&state);
             if (action == CONNMARK_RESTORE_DEFER) {
-                deferred++;
-                continue;
+                family_deferred = 1;
+                break;
             }
             if (action == CONNMARK_RESTORE_NONE) continue;
 
@@ -353,8 +385,6 @@ int iptables_fast_restore_cached(void) {
 
             char rule[512];
             if (action == CONNMARK_RESTORE_PAIR) {
-                const char *packet_condition = target->global_routing
-                    ? "" : "-m mark ! --mark 0xffffaa0/0xffffff0 ";
                 if (connmark_format_set_rule(rule, sizeof(rule), packet_condition,
                                               target->ipset_name,
                                               target->mark_hex) != 0 ||
@@ -378,6 +408,10 @@ int iptables_fast_restore_cached(void) {
             fam->rule_count++;
         }
 
+        if (family_deferred) {
+            deferred += family_target_count;
+            continue;
+        }
         if (family_failed || fam->rule_count == 0) continue;
         if (batch_append(fam, "COMMIT\n") != 0) {
             family_failed = 1;
