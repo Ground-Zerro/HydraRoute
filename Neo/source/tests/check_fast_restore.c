@@ -9,6 +9,12 @@ static const char *exact_pair =
     "-j CONNMARK --set-xmark 0x3001/0xffffffff\n"
     "-A PREROUTING -m set --match-set nwg0 dst -j CONNMARK "
     "--restore-mark --nfmask 0xffffffff --ctmask 0xffffffff\n";
+static const char *exact_global_pair =
+    "-A PREROUTING -m connmark --mark 0x0/0xffffffff "
+    "-m set --match-set nwg0 dst -j CONNMARK "
+    "--set-xmark 0x3001/0xffffffff\n"
+    "-A PREROUTING -m set --match-set nwg0 dst -j CONNMARK "
+    "--restore-mark --nfmask 0xffffffff --ctmask 0xffffffff\n";
 static const char *conflicting_pair =
     "-A PREROUTING -m connmark --mark 0x0/0xffffffff "
     "-m set --match-set nwg0 dst -j CONNMARK "
@@ -36,6 +42,12 @@ static const char *restore_with_partial_masks =
     "--restore-mark --nfmask 0xff --ctmask 0xffffffff\n";
 static const char *exact_pair_with_implicit_connmark_mask =
     "-A PREROUTING -m connmark --mark 0x0 "
+    "-m set --match-set nwg0 dst -j CONNMARK "
+    "--set-xmark 0x3001/0xffffffff\n"
+    "-A PREROUTING -m set --match-set nwg0 dst -j CONNMARK "
+    "--restore-mark --nfmask 0xffffffff --ctmask 0xffffffff\n";
+static const char *exact_pair_with_source_predicate =
+    "-A PREROUTING -s 192.0.2.0/24 -m connmark --mark 0x0/0xffffffff "
     "-m set --match-set nwg0 dst -j CONNMARK "
     "--set-xmark 0x3001/0xffffffff\n"
     "-A PREROUTING -m set --match-set nwg0 dst -j CONNMARK "
@@ -154,6 +166,26 @@ static int check_expected_packet_conditions(void) {
         fprintf(stderr, "reject-global-as-non-global\n");
         return 1;
     }
+    if (connmark_rule_state_for_condition(exact_pair, "nwg0", "3001", "",
+                                          &state) != 0 ||
+        connmark_restore_action(&state) != CONNMARK_RESTORE_DEFER) {
+        fprintf(stderr, "reject-non-global-as-explicit-global\n");
+        return 1;
+    }
+    return 0;
+}
+
+static int check_authoritative_repair_decision(void) {
+    connmark_rule_state_t state;
+    if (check_state("extra-source-predicate", exact_pair_with_source_predicate,
+                    "nwg0", "3001", 0, 1, 1) != 0)
+        return 1;
+    if (connmark_rule_state_for_condition(exact_pair_with_source_predicate,
+                                          "nwg0", "3001", "", &state) != 0 ||
+        connmark_restore_action(&state) != CONNMARK_RESTORE_DEFER) {
+        fprintf(stderr, "authoritative-repair-extra-source-predicate\n");
+        return 1;
+    }
     return 0;
 }
 
@@ -198,7 +230,7 @@ static int check_multi_target_ordering(void) {
         fprintf(stderr, "allow-full-rebuild-in-order\n");
         return 1;
     }
-    if (connmark_restore_order_safe(exact_pair, ordered_targets,
+    if (connmark_restore_order_safe(exact_global_pair, ordered_targets,
                                     sizeof(ordered_targets) /
                                         sizeof(ordered_targets[0])) != 0) {
         fprintf(stderr, "allow-missing-lower-priority-target\n");
@@ -222,6 +254,7 @@ int main(void) {
                           exact_pair_with_implicit_connmark_mask,
                           "nwg0", "3001", 1, 1, 0);
     failed |= check_expected_packet_conditions();
+    failed |= check_authoritative_repair_decision();
     failed |= check_multi_target_ordering();
 
     if (failed)

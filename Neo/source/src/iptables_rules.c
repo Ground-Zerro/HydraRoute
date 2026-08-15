@@ -203,6 +203,88 @@ static int has_global_token(const rule_token_t *tokens, size_t token_count,
     return 0;
 }
 
+static int consume_option_tokens(const rule_token_t *tokens, size_t token_count,
+                                 const char *option, int has_value,
+                                 int *consumed) {
+    int found = 0;
+    for (size_t i = 0; i < token_count; i++) {
+        if (!token_equals(&tokens[i], option)) continue;
+        found++;
+        consumed[i] = 1;
+        if (!has_value) continue;
+        if (i + 1 >= token_count) return -1;
+        consumed[i + 1] = 1;
+    }
+    return found;
+}
+
+static int canonical_token_sequence(const rule_token_t *tokens,
+                                    size_t token_count, int allow_mark,
+                                    int allow_connmark, int set_rule) {
+    if (token_count > MAX_RULE_TOKENS || token_count < 2 ||
+        !token_equals(&tokens[0], "-A") ||
+        !token_equals(&tokens[1], "PREROUTING"))
+        return 0;
+
+    int consumed[MAX_RULE_TOKENS] = {0};
+    consumed[0] = 1;
+    consumed[1] = 1;
+
+    for (size_t i = 0; i < token_count; i++) {
+        if (!token_equals(&tokens[i], "-m")) continue;
+        if (i + 1 >= token_count) return 0;
+        if (!token_equals(&tokens[i + 1], "set") &&
+            !(allow_mark && token_equals(&tokens[i + 1], "mark")) &&
+            !(allow_connmark && token_equals(&tokens[i + 1], "connmark")))
+            return 0;
+
+        size_t end = token_count;
+        for (size_t j = i + 2; j < token_count; j++) {
+            if (token_equals(&tokens[j], "-m") ||
+                token_equals(&tokens[j], "-j") ||
+                token_equals(&tokens[j], "-g")) {
+                end = j;
+                break;
+            }
+        }
+        consumed[i] = 1;
+        consumed[i + 1] = 1;
+        for (size_t j = i + 2; j < end; j++) consumed[j] = 1;
+    }
+
+    int jumps = 0;
+    for (size_t i = 0; i < token_count; i++) {
+        if (!token_equals(&tokens[i], "-j")) continue;
+        if (i + 1 >= token_count) return 0;
+        consumed[i] = 1;
+        consumed[i + 1] = 1;
+        jumps++;
+    }
+    if (jumps != 1) return 0;
+
+    int found;
+    if (set_rule) {
+        found = consume_option_tokens(tokens, token_count, "--set-xmark", 1,
+                                      consumed);
+        if (found != 1) return 0;
+    } else {
+        found = consume_option_tokens(tokens, token_count, "--restore-mark", 0,
+                                      consumed);
+        if (found != 1) return 0;
+        found = consume_option_tokens(tokens, token_count, "--nfmask", 1,
+                                      consumed);
+        if (found != 1) return 0;
+        found = consume_option_tokens(tokens, token_count, "--ctmask", 1,
+                                      consumed);
+        if (found != 1) return 0;
+    }
+
+    for (size_t i = 0; i < token_count; i++) {
+        if (!consumed[i]) return 0;
+    }
+    return 1;
+}
+
 static int exact_jump(const rule_token_t *tokens, size_t token_count) {
     int jumps = 0;
     int connmark_jumps = 0;
@@ -219,7 +301,7 @@ static int packet_condition_matches(const rule_token_t *tokens,
                                     size_t token_count,
                                     const char *expected_condition) {
     int mark_modules = module_count(tokens, token_count, "mark");
-    if (!expected_condition || expected_condition[0] == '\0') {
+    if (!expected_condition) {
         if (mark_modules == 0) return 1;
         if (mark_modules != 1) return 0;
 
@@ -240,6 +322,8 @@ static int packet_condition_matches(const rule_token_t *tokens,
         return actual_value == UINT32_C(0xffffaa0) &&
                actual_mask == UINT32_C(0xffffff0);
     }
+
+    if (expected_condition[0] == '\0') return mark_modules == 0;
 
     rule_token_t expected_tokens[8];
     size_t expected_count;
@@ -322,6 +406,7 @@ static int canonical_set_rule(const rule_token_t *tokens, size_t token_count,
         !exact_jump(tokens, token_count) ||
         has_global_token(tokens, token_count, "-g") ||
         !packet_condition_matches(tokens, token_count, packet_condition) ||
+        !canonical_token_sequence(tokens, token_count, 1, 1, 1) ||
         has_global_token(tokens, token_count, "--restore-mark") ||
         has_global_token(tokens, token_count, "--nfmask") ||
         has_global_token(tokens, token_count, "--ctmask") ||
@@ -369,7 +454,8 @@ static int canonical_restore_rule(const rule_token_t *tokens, size_t token_count
         !modules_are_allowed(tokens, token_count, 0, 0) ||
         !target_match(tokens, token_count, ipset_name) ||
         !exact_jump(tokens, token_count) ||
-        has_global_token(tokens, token_count, "-g"))
+        has_global_token(tokens, token_count, "-g") ||
+        !canonical_token_sequence(tokens, token_count, 0, 0, 0))
         return 0;
 
     int restore_count, nfmask_count, ctmask_count;
