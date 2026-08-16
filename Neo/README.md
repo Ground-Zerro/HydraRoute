@@ -106,7 +106,7 @@ opkg update && opkg upgrade
 - **Conntrack:** `ConntrackFlush`
 - **Маршрутизация:** `GlobalRouting`, `PolicyOrder`
 - **GeoIP / GeoSite:** `GeoIPFile`, `GeoSiteFile` (оба повторяемые)
-- **RCI:** `rciToken` — токен доступа Keenetic, нужен на прошивках, где локальный RCI требует авторизации
+- **RCI:** `rciToken` — токен доступа Keenetic для прошивок, где локальный RCI требует авторизации; заполнять вручную не нужно — hrneo выпускает и обновляет токен сам
 - **L7-перехват:** `l7CaptureEnabled`, `l7NflogGroup`, `l7EnableTLS`, `l7EnableHTTP`, `l7EnableQUIC`, `l7WanInterface`, `l7ConnbytesMax`, `l7TcpReasmEnabled`, `l7TcpReasmMaxEntries`, `l7TcpReasmTtlSec`
 
 > Полное описание каждого параметра, дефолтов, поведения и взаимодействия с роутером (RCI, PolicyOrder, ConntrackFlush и т.д.) — см. **[docs/HRNEO.CONF.md](docs/HRNEO.CONF.md)**.

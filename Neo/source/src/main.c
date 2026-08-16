@@ -43,8 +43,11 @@ static int g_l7_active;
 static char g_l7_wan[MAX_INTERFACE_NAME];
 static tcp_reasm_t g_reasm;
 static int g_reasm_active;
-static int g_commit_retry;
-static long long g_commit_deadline;
+static int g_commit_active;
+static const char *g_cfg_path = DEFAULT_CONFIG_PATH;
+static char g_policy_names[MAX_POLICY_ORDER][64];
+static int g_policy_names_count;
+static int g_policies_pending;
 
 static int create_pid_file(const char *path) {
     FILE *f = fopen(path, "r");
@@ -245,6 +248,12 @@ static void process_dns_packet(const uint8_t *pkt, int pkt_len, void *user_data)
 }
 
 static int perform_update(void) {
+    rci_auth_recover(g_cfg_path);
+
+    if (g_policies_pending)
+        g_policies_pending = rci_create_policies((const char (*)[64])g_policy_names,
+                                                 g_policy_names_count) != 0;
+
     if (g_drm_active) {
         char old_states[MAX_INTERFACES][2][32];
         int old_count;
@@ -259,20 +268,18 @@ static int perform_update(void) {
 
 static void commit_run(signal_mgr_t *m) {
     if (perform_update() == 0) {
-        if (g_commit_retry > 0)
-            LOG_INFO("netfilter rules committed after %d retries", g_commit_retry);
-        else
-            LOG_INFO("netfilter rules committed");
-        g_commit_retry = 0;
+        LOG_INFO("netfilter rules committed");
+        g_commit_active = 0;
         return;
     }
+    LOG_WARN("netfilter commit incomplete, retry in %d ms", NF_COMMIT_INTERVAL_MS);
+    signal_mgr_arm_timer(m, NF_COMMIT_INTERVAL_MS);
+}
 
-    int shift = g_commit_retry < 16 ? g_commit_retry : 16;
-    long delay = (long)NF_COMMIT_RETRY_MIN_MS << shift;
-    if (delay > NF_COMMIT_RETRY_MAX_MS) delay = NF_COMMIT_RETRY_MAX_MS;
-    g_commit_retry++;
-    LOG_WARN("netfilter commit incomplete, retry %d in %ld ms", g_commit_retry, delay);
-    signal_mgr_arm_timer(m, (int)delay);
+static void commit_start(signal_mgr_t *m) {
+    g_commit_active = 1;
+    perform_update();
+    signal_mgr_arm_timer(m, NF_COMMIT_INTERVAL_MS);
 }
 
 static void add_unique_name(char names[][64], int *count, const char *name, int max) {
@@ -324,6 +331,7 @@ int main(int argc, char *argv[]) {
     }
 
     const char *cfg_path = args.config_path[0] ? args.config_path : DEFAULT_CONFIG_PATH;
+    g_cfg_path = cfg_path;
     int cfg_err = config_read(cfg_path, &g_config);
     if (cfg_err != 0 && args.config_path[0]) {
         return 1;
@@ -336,8 +344,8 @@ int main(int argc, char *argv[]) {
 
     log_setup(&g_config);
     LOG_INFO("HRNeo v%s starting", VERSION);
-    if (g_config.rci_token[0])
-        LOG_INFO("Keenetic RCI token configured, X-NDMA-TKN authentication enabled");
+
+    rci_token_bootstrap(cfg_path);
 
     if (create_pid_file(DEFAULT_PID_FILE) != 0) {
         log_close();
@@ -461,7 +469,14 @@ int main(int argc, char *argv[]) {
             LOG_INFO("  [%d] %s (policy)", i, g_all_sorted[i].pair.ipv4);
     }
 
-    rci_create_policies((const char (*)[64])policy_names, policy_count);
+    g_policy_names_count = policy_count;
+    for (int i = 0; i < policy_count; i++) {
+        strncpy(g_policy_names[i], policy_names[i], 63);
+        g_policy_names[i][63] = '\0';
+    }
+    g_policies_pending = rci_create_policies((const char (*)[64])policy_names, policy_count) != 0;
+    if (g_policies_pending)
+        LOG_ERROR("Policy creation failed, will retry on next netfilter commit");
 
     if (ipset_manager_init(&g_ipset_mgr) != 0) {
         LOG_ERROR("Failed to init ipset manager");
@@ -605,7 +620,7 @@ int main(int argc, char *argv[]) {
 
     LOG_INFO("Packet capture started, waiting for DNS responses...");
 
-    commit_run(&signals);
+    commit_start(&signals);
 
     struct epoll_event events[8];
     while (!g_shutdown) {
@@ -636,19 +651,16 @@ int main(int argc, char *argv[]) {
                         LOG_INFO("Received signal %d, shutting down...", si.ssi_signo);
                         g_shutdown = 1;
                     } else if (si.ssi_signo == SIGUSR1) {
-                        long long now = signal_mgr_now_ms();
-                        if (g_commit_deadline == 0)
-                            g_commit_deadline = now + NF_COMMIT_MAX_DEFER_MS;
-                        int delay = signal_mgr_debounce_delay(now, g_commit_deadline,
-                                                              NF_COMMIT_DEBOUNCE_MS);
-                        LOG_DEBUG("SIGUSR1 received, commit in %d ms", delay);
-                        g_commit_retry = 0;
-                        signal_mgr_arm_timer(&signals, delay);
+                        if (g_commit_active) {
+                            LOG_DEBUG("SIGUSR1 ignored, commit cycle active");
+                        } else {
+                            LOG_DEBUG("SIGUSR1 received, committing now");
+                            commit_start(&signals);
+                        }
                     }
                 }
             } else if (events[i].data.fd == signals.timer_fd) {
                 signal_mgr_read_timer(&signals);
-                g_commit_deadline = 0;
                 commit_run(&signals);
             }
         }

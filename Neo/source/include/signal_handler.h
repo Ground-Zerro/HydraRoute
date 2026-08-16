@@ -10,7 +10,5 @@ int  signal_mgr_init(signal_mgr_t *m);
 void signal_mgr_close(signal_mgr_t *m);
 void signal_mgr_arm_timer(signal_mgr_t *m, int milliseconds);
 int  signal_mgr_read_timer(signal_mgr_t *m);
-long long signal_mgr_now_ms(void);
-int  signal_mgr_debounce_delay(long long now_ms, long long deadline_ms, int debounce_ms);
 
 #endif

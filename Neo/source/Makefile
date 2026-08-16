@@ -1,5 +1,5 @@
 PROJECT = hrneo
-VERSION = 3.17.0-1
+VERSION = 3.18.2-1
 
 CC_MIPSEL   = mipsel-linux-muslsf-gcc
 CC_MIPS     = mips-linux-muslsf-gcc
@@ -75,8 +75,10 @@ build/$(PROJECT)-aarch64: $(SRCS)
 
 check:
 	@mkdir -p build
-	$(CC_NATIVE) $(CFLAGS_NATIVE) tests/check_nf.c src/l7_firewall.c src/util.c src/log.c src/signal_handler.c -o build/check_nf
+	$(CC_NATIVE) $(CFLAGS_NATIVE) tests/check_nf.c src/l7_firewall.c src/util.c src/log.c -o build/check_nf
 	./build/check_nf
+	$(CC_NATIVE) $(CFLAGS_NATIVE) tests/check_rci.c src/util.c src/log.c src/config.c src/params.c -o build/check_rci
+	./build/check_rci
 
 clean:
 	rm -rf build/

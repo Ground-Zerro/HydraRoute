@@ -156,11 +156,16 @@ int apply_unified_connmark_rules(const unified_target_t *targets, int count,
 
         int r = rci_get_policy_mark(targets[i].pair.ipv4, policy_marks[i],
                                     sizeof(policy_marks[i]));
-        if (r < 0) {
+        if (r == RCI_MARK_TRANSPORT) {
             LOG_WARN("RCI unreachable while reading policy %s", targets[i].pair.ipv4);
             return -1;
         }
-        if (r == 0) {
+        if (r == RCI_MARK_DENIED) {
+            LOG_WARN("RCI denied reading policy %s: access token required or rejected",
+                     targets[i].pair.ipv4);
+            return -1;
+        }
+        if (r == RCI_MARK_ABSENT) {
             LOG_WARN("Policy %s has no mark ID yet", targets[i].pair.ipv4);
             incomplete = 1;
         }
