@@ -118,6 +118,40 @@ static void check_emit_no_quic(void) {
     assert(!strstr(out, "-p udp"));
 }
 
+static void check_emit_concat_dump(void) {
+    config_t cfg = make_cfg();
+    const char *dump =
+        "-P PREROUTING ACCEPT\n"
+        "-A PREROUTING -j _NDM_HOTSPOT_PREROUTING_MANGL\n"
+        "-A PREROUTING -m set --match-set HydraRoute dst -j CONNMARK --restore-mark "
+        "--nfmask 0xffffffff --ctmask 0xffffffff\n"
+        "-P FORWARD ACCEPT\n"
+        "-A FORWARD -j NDMMARK --set-xndmmark 0x4/0x0\n"
+        "-A FORWARD -o eth3 -p tcp -m tcp --dport 443 --tcp-flags SYN,ACK ACK "
+        "-m connbytes --connbytes 2:8 --connbytes-mode packets --connbytes-dir original "
+        "-m length --length 60:65535 -j NFLOG --nflog-group 210\n"
+        "-A FORWARD -o eth3 -p tcp -m tcp --dport 80 --tcp-flags SYN,ACK ACK "
+        "-m connbytes --connbytes 2:4 --connbytes-mode packets --connbytes-dir original "
+        "-m length --length 60:65535 -j NFLOG --nflog-group 210\n"
+        "-A FORWARD -o eth3 -p udp -m udp --dport 443 -m length --length 1200:65535 "
+        "-j NFLOG --nflog-group 210\n"
+        "-P OUTPUT ACCEPT\n"
+        "-A OUTPUT -j _NDM_OUTPUT_DELAY\n";
+
+    char out[4096];
+    int n = l7_firewall_emit_rules(&cfg, "eth3", dump, out, sizeof(out));
+    assert(n > 0);
+    out[n] = '\0';
+
+    int lines = 0;
+    for (int i = 0; i < n; i++) if (out[i] == '\n') lines++;
+    assert(lines == 3);
+    assert(!strstr(out, "-A FORWARD "));
+    assert(strstr(out, "-A OUTPUT -o eth3 -p tcp --dport 443 "));
+    assert(strstr(out, "-A OUTPUT -o eth3 -p tcp --dport 80 "));
+    assert(strstr(out, "-A OUTPUT -o eth3 -p udp --dport 443 "));
+}
+
 static int count_tokens(const char *s) {
     int n = 0;
     while (*s) {
@@ -148,6 +182,7 @@ int main(void) {
     check_emit_overflow();
     check_emit_no_wan();
     check_emit_no_quic();
+    check_emit_concat_dump();
     printf("check_nf: all assertions passed\n");
     return 0;
 }

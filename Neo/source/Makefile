@@ -1,5 +1,5 @@
 PROJECT = hrneo
-VERSION = 3.18.2-1
+VERSION = 3.18.3-1
 
 CC_MIPSEL   = mipsel-linux-muslsf-gcc
 CC_MIPS     = mips-linux-muslsf-gcc
@@ -57,19 +57,19 @@ native: CFLAGS = $(CFLAGS_NATIVE)
 native: LDFLAGS = $(LDFLAGS_DYNAMIC)
 native: build/$(PROJECT)
 
-build/$(PROJECT): $(SRCS)
+build/$(PROJECT): $(SRCS) Makefile
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(SRCS) -o $@ $(LDFLAGS) $(LIBS)
 
-build/$(PROJECT)-mipsel: $(SRCS)
+build/$(PROJECT)-mipsel: $(SRCS) Makefile
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(SRCS) -o $@ $(LDFLAGS) $(LIBS)
 
-build/$(PROJECT)-mips: $(SRCS)
+build/$(PROJECT)-mips: $(SRCS) Makefile
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(SRCS) -o $@ $(LDFLAGS) $(LIBS)
 
-build/$(PROJECT)-aarch64: $(SRCS)
+build/$(PROJECT)-aarch64: $(SRCS) Makefile
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(SRCS) -o $@ $(LDFLAGS) $(LIBS)
 

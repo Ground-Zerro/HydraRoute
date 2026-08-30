@@ -68,7 +68,7 @@
 | `RCI_MAX_RESPONSE` | 1 МБ | Размер буферов `raw_buf` и `response_buf` |
 | `RCI_TIMEOUT_SEC` | 10 | `SO_RCVTIMEO` / `SO_SNDTIMEO` |
 | `NF_COMMIT_INTERVAL_MS` | 3000 | Пауза между попытками коммита netfilter; SIGUSR1 в этом окне игнорируются |
-| `IPT_DUMP_SIZE` | 32768 | Буфер дампа `iptables -t mangle -S` на семью |
+| `IPT_DUMP_SIZE` | 65536 | Буфер дампа `iptables -t mangle -S <chain>` (PREROUTING + FORWARD/OUTPUT при L7) на семью |
 | `IPT_BATCH_SIZE` | 16384 | Буфер batch для `iptables-restore` на семью |
 | `IPT_MAX_RULE_ARGS` | 64 | Максимум argv-токенов при удалении правила |
 

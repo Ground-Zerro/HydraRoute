@@ -4,7 +4,7 @@
 #include "hrneo.h"
 #include "rci.h"
 
-#define IPT_DUMP_SIZE       32768
+#define IPT_DUMP_SIZE       65536
 #define IPT_BATCH_SIZE      16384
 #define IPT_MAX_RULE_ARGS   64
 

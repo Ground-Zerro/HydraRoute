@@ -33,8 +33,8 @@ static void get_br0_global_ipv6(char *ipv6_net, int ipv6_size) {
     }
 }
 
-static const char *find_mark_in_rules(const char *dump, const char *ipset_name) {
-    static char mark_buf[16];
+static int find_mark_in_rules(const char *dump, const char *ipset_name,
+                              char *mark_out, size_t mark_size) {
     char match_pattern[128];
     snprintf(match_pattern, sizeof(match_pattern), "--match-set %s dst", ipset_name);
 
@@ -52,23 +52,26 @@ static const char *find_mark_in_rules(const char *dump, const char *ipset_name) 
                     xmark += 2;
                 const char *slash = line_find(xmark, len - (size_t)(xmark - line), "/");
                 size_t mlen = slash ? (size_t)(slash - xmark) : 0;
-                if (mlen > 0 && mlen < sizeof(mark_buf)) {
-                    memcpy(mark_buf, xmark, mlen);
-                    mark_buf[mlen] = '\0';
-                    return mark_buf;
+                if (mlen > 0 && mlen < mark_size) {
+                    memcpy(mark_out, xmark, mlen);
+                    mark_out[mlen] = '\0';
+                    return 1;
                 }
             }
         }
         line = nl ? nl + 1 : NULL;
     }
-    return NULL;
+    return 0;
 }
 
 void iptables_delete_rules_matching(const char *ipt_cmd, const char *chain,
                                     const char *needle1, const char *needle2) {
     char *argv[] = {(char *)ipt_cmd, "-w", "-t", "mangle", "-S", (char *)chain, NULL};
     char output[IPT_DUMP_SIZE];
-    if (run_command_output(ipt_cmd, argv, output, sizeof(output)) != 0) return;
+    if (run_command_output(ipt_cmd, argv, output, sizeof(output)) != 0) {
+        LOG_WARN("%s -t mangle -S %s failed or output truncated", ipt_cmd, chain);
+        return;
+    }
 
     char *line = output;
     while (line && *line) {
@@ -129,6 +132,24 @@ typedef struct {
     int  rule_count;
 } connmark_family_t;
 
+static const char *const DUMP_CHAINS[] = {"PREROUTING", "FORWARD", "OUTPUT"};
+
+static int dump_chains(connmark_family_t *fam, int chain_count) {
+    size_t off = 0;
+    for (int c = 0; c < chain_count; c++) {
+        char *argv[] = {(char *)fam->ipt_cmd, "-w", "-t", "mangle", "-S",
+                        (char *)DUMP_CHAINS[c], NULL};
+        if (run_command_output(fam->ipt_cmd, argv, fam->dump + off,
+                               sizeof(fam->dump) - off) != 0) {
+            LOG_WARN("%s -t mangle -S %s failed or output truncated",
+                     fam->ipt_cmd, DUMP_CHAINS[c]);
+            return -1;
+        }
+        off += strlen(fam->dump + off);
+    }
+    return 0;
+}
+
 static int batch_append(connmark_family_t *fam, const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
@@ -144,45 +165,22 @@ static int batch_append(connmark_family_t *fam, const char *fmt, ...) {
 
 int apply_unified_connmark_rules(const unified_target_t *targets, int count,
                                  const config_t *cfg, const char *l7_wan) {
+    static int startup_audit = 1;
+
     char ipv6_net[64];
     get_br0_global_ipv6(ipv6_net, sizeof(ipv6_net));
 
-    char policy_marks[MAX_POLICY_ORDER + MAX_INTERFACES][16];
     int incomplete = 0;
 
-    for (int i = 0; i < count; i++) {
-        policy_marks[i][0] = '\0';
-        if (targets[i].is_interface) continue;
+    static connmark_family_t fams[2];
+    fams[0].ipt_cmd = "iptables";  fams[0].restore_cmd = "iptables-restore";
+    fams[1].ipt_cmd = "ip6tables"; fams[1].restore_cmd = "ip6tables-restore";
 
-        int r = rci_get_policy_mark(targets[i].pair.ipv4, policy_marks[i],
-                                    sizeof(policy_marks[i]));
-        if (r == RCI_MARK_TRANSPORT) {
-            LOG_WARN("RCI unreachable while reading policy %s", targets[i].pair.ipv4);
-            return -1;
-        }
-        if (r == RCI_MARK_DENIED) {
-            LOG_WARN("RCI denied reading policy %s: access token required or rejected",
-                     targets[i].pair.ipv4);
-            return -1;
-        }
-        if (r == RCI_MARK_ABSENT) {
-            LOG_WARN("Policy %s has no mark ID yet", targets[i].pair.ipv4);
-            incomplete = 1;
-        }
-    }
-
-    static connmark_family_t fams[2] = {
-        { .ipt_cmd = "iptables",  .restore_cmd = "iptables-restore"  },
-        { .ipt_cmd = "ip6tables", .restore_cmd = "ip6tables-restore" },
-    };
+    int chain_count = (l7_wan && l7_wan[0]) ? 3 : 1;
 
     for (int fi = 0; fi < 2; fi++) {
         connmark_family_t *fam = &fams[fi];
-        char *argv[] = {(char *)fam->ipt_cmd, "-w", "-t", "mangle", "-S", NULL};
-        if (run_command_output(fam->ipt_cmd, argv, fam->dump, sizeof(fam->dump)) != 0) {
-            LOG_WARN("%s -t mangle -S failed or output truncated", fam->ipt_cmd);
-            return -1;
-        }
+        if (dump_chains(fam, chain_count) != 0) return -1;
         fam->off = 0;
         fam->rule_count = 0;
         if (batch_append(fam, "*mangle\n") != 0) return -1;
@@ -191,28 +189,66 @@ int apply_unified_connmark_rules(const unified_target_t *targets, int count,
     const char *pkt_cond = cfg->global_routing ? "" : "-m mark ! --mark 0xffffaa0/0xffffff0 ";
 
     for (int i = 0; i < count; i++) {
-        char mark_hex[16] = {0};
+        const char *set_names[2] = { targets[i].pair.ipv4, targets[i].pair.ipv6 };
+        char present_mark[2][16];
+        int  present[2] = {0, 0}, skip[2] = {0, 0};
+        int  need_mark = startup_audit;
 
+        for (int fi = 0; fi < 2; fi++) {
+            if (fi == 1 && !targets[i].is_interface && ipv6_net[0] == '\0') {
+                skip[fi] = 1;
+                continue;
+            }
+            present[fi] = find_mark_in_rules(fams[fi].dump, set_names[fi],
+                                             present_mark[fi], sizeof(present_mark[fi]));
+            if (!present[fi]) need_mark = 1;
+        }
+        if (!need_mark) continue;
+
+        char mark_hex[16] = {0};
         if (targets[i].is_interface) {
             snprintf(mark_hex, sizeof(mark_hex), "%x", targets[i].fwmark);
         } else {
-            if (policy_marks[i][0] == '\0') continue;
-            strncpy(mark_hex, policy_marks[i], sizeof(mark_hex) - 1);
+            int r = rci_get_policy_mark(set_names[0], mark_hex, sizeof(mark_hex));
+            if (r == RCI_MARK_TRANSPORT) {
+                LOG_WARN("RCI unreachable while reading policy %s", set_names[0]);
+                incomplete = 1;
+                continue;
+            }
+            if (r == RCI_MARK_DENIED) {
+                LOG_WARN("RCI denied reading policy %s: access token required or rejected",
+                         set_names[0]);
+                incomplete = 1;
+                continue;
+            }
+            if (r == RCI_MARK_ABSENT) {
+                LOG_WARN("Policy %s has no mark ID yet", set_names[0]);
+                incomplete = 1;
+                for (int fi = 0; fi < 2; fi++) {
+                    if (skip[fi] || !present[fi]) continue;
+                    char needle[128];
+                    snprintf(needle, sizeof(needle), "--match-set %s ", set_names[fi]);
+                    LOG_INFO("Policy %s is gone, removing orphaned rules for %s",
+                             set_names[0], set_names[fi]);
+                    iptables_delete_rules_matching(fams[fi].ipt_cmd, "PREROUTING",
+                                                   needle, NULL);
+                }
+                continue;
+            }
         }
 
         for (int fi = 0; fi < 2; fi++) {
             connmark_family_t *fam = &fams[fi];
-            const char *set_name = (fi == 0) ? targets[i].pair.ipv4 : targets[i].pair.ipv6;
+            const char *set_name = set_names[fi];
 
-            const char *current_mark = find_mark_in_rules(fam->dump, set_name);
-            if (current_mark && strcmp(current_mark, mark_hex) == 0) continue;
-            if (fi == 1 && !targets[i].is_interface && ipv6_net[0] == '\0') continue;
-
-            if (current_mark) {
+            if (skip[fi]) continue;
+            if (present[fi]) {
+                if (!startup_audit) continue;
+                if (strcmp(present_mark[fi], mark_hex) == 0) continue;
                 char needle[128];
                 snprintf(needle, sizeof(needle), "--match-set %s ", set_name);
                 LOG_INFO("Mark changed for %s: %s -> %s, recreating",
-                         set_name, current_mark, mark_hex);
+                         set_name, present_mark[fi], mark_hex);
                 iptables_delete_rules_matching(fam->ipt_cmd, "PREROUTING", needle, NULL);
             }
 
@@ -259,7 +295,9 @@ int apply_unified_connmark_rules(const unified_target_t *targets, int count,
         LOG_DEBUG("Committed %d rule groups via %s", fam->rule_count, fam->restore_cmd);
     }
 
-    return incomplete ? -1 : 0;
+    if (incomplete) return -1;
+    startup_audit = 0;
+    return 0;
 }
 
 int cleanup_connmark_rules(const ipset_pair_t *pairs, int count) {
