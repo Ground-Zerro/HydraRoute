@@ -63,7 +63,7 @@ int parse_watchlist_lines(const char *path,
 
 static void watchlist_insert_domain(const char *target, const char *domain,
                                     size_t dlen, void *user) {
-    ht_insert((domain_hashtable_t *)user, domain, dlen, target, 1);
+    ht_insert((domain_hashtable_t *)user, domain, dlen, target);
 }
 
 int parse_watchlist(const char *path, domain_hashtable_t *ht) {
@@ -74,25 +74,9 @@ int parse_watchlist(const char *path, domain_hashtable_t *ht) {
 }
 
 int get_unique_names(const domain_hashtable_t *ht, char names[][64], int max_names) {
-    int count = 0;
-    for (int i = 0; i < DOMAIN_HT_BUCKETS; i++) {
-        for (domain_node_t *node = ht->buckets[i]; node; node = node->next) {
-            if (!node->entry.ipset_name)
-                continue;
-            int found = 0;
-            for (int j = 0; j < count; j++) {
-                if (strcmp(names[j], node->entry.ipset_name) == 0) {
-                    found = 1;
-                    break;
-                }
-            }
-            if (!found && count < max_names) {
-                strncpy(names[count], node->entry.ipset_name, 63);
-                names[count][63] = '\0';
-                count++;
-            }
-        }
-    }
+    int count = ht->target_count < max_names ? ht->target_count : max_names;
+    for (int i = 0; i < count; i++)
+        memcpy(names[i], ht->targets[i].name, 64);
     return count;
 }
 
@@ -118,10 +102,10 @@ static int cmp_policy_entry(const void *a, const void *b) {
 }
 
 void sort_policies(char names[][64], int count, const char order[][64], int order_count) {
-    if (count <= 0 || count > MAX_POLICY_ORDER + MAX_INTERFACES)
+    if (count <= 0 || count > MAX_TARGETS)
         return;
 
-    policy_sort_entry_t entries[MAX_POLICY_ORDER + MAX_INTERFACES];
+    policy_sort_entry_t entries[MAX_TARGETS];
     for (int i = 0; i < count; i++) {
         entries[i].priority = get_policy_priority(order, order_count, names[i]);
         memcpy(entries[i].name, names[i], 64);
@@ -145,50 +129,37 @@ void sort_policies(char names[][64], int count, const char order[][64], int orde
         memcpy(names[i], entries[i].name, 64);
 }
 
-static const char *match_domain(const domain_hashtable_t *ht,
-                                const char (*policy_order)[64], int order_count,
-                                const char *domain, size_t domain_len) {
-    const char *best_match = NULL;
-    int best_priority = -1;
-    int best_specificity = -1;
-
-    domain_entry_t *exact = ht_lookup(ht, domain, domain_len);
-    if (exact) {
-        best_match = exact->ipset_name;
-        best_priority = get_policy_priority(policy_order, order_count, exact->ipset_name);
-        best_specificity = (int)domain_len + 1;
-    }
+const ht_target_t *watchlist_match(const domain_hashtable_t *ht,
+                                   const char *domain, size_t domain_len,
+                                   const char **key) {
+    const ht_target_t *best = ht_lookup(ht, domain, domain_len);
+    const char *best_key = domain;
 
     for (size_t i = 0; i < domain_len; i++) {
         if (domain[i] == '.') {
             const char *suffix = domain + i + 1;
             size_t suffix_len = domain_len - i - 1;
             if (suffix_len == 0) continue;
-            domain_entry_t *entry = ht_lookup(ht, suffix, suffix_len);
-            if (entry && entry->match_subs) {
-                int p = get_policy_priority(policy_order, order_count, entry->ipset_name);
-                int spec = (int)suffix_len;
-                if (!best_match || p < best_priority ||
-                    (p == best_priority && spec > best_specificity)) {
-                    best_match = entry->ipset_name;
-                    best_priority = p;
-                    best_specificity = spec;
-                }
+            const ht_target_t *target = ht_lookup(ht, suffix, suffix_len);
+            if (target && (!best || target->rank < best->rank)) {
+                best = target;
+                best_key = suffix;
             }
         }
     }
 
-    return best_match;
+    if (key) *key = best_key;
+    return best;
 }
 
 const char *match_domain_with_cname(const domain_hashtable_t *ht,
-                                    const char (*policy_order)[64], int order_count,
                                     const char *domain,
                                     const dns_cname_t *cnames, int cname_count,
                                     const char **matched_domain) {
     const char *queue[MAX_CNAME_CHAIN];
     uint32_t visited_hashes[MAX_CNAME_CHAIN];
     int head = 0, tail = 0, visited_count = 0;
+    const ht_target_t *best = NULL;
 
     queue[tail++] = domain;
 
@@ -205,10 +176,11 @@ const char *match_domain_with_cname(const domain_hashtable_t *ht,
         if (visited_count < MAX_CNAME_CHAIN)
             visited_hashes[visited_count++] = h;
 
-        const char *ipset = match_domain(ht, policy_order, order_count, current, cur_len);
-        if (ipset) {
+        const ht_target_t *target = watchlist_match(ht, current, cur_len, NULL);
+        if (target && (!best || target->rank < best->rank)) {
+            best = target;
             if (matched_domain) *matched_domain = current;
-            return ipset;
+            if (target->rank == 0) break;
         }
 
         for (int i = 0; i < cname_count; i++) {
@@ -221,5 +193,5 @@ const char *match_domain_with_cname(const domain_hashtable_t *ht,
         }
     }
 
-    return NULL;
+    return best ? best->name : NULL;
 }

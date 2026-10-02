@@ -51,13 +51,35 @@ static char *ht_pool_strdup(domain_hashtable_t *ht, const char *s, size_t len) {
     return dst;
 }
 
-int ht_insert(domain_hashtable_t *ht, const char *domain, size_t domain_len, const char *ipset_name, int match_subs) {
+static ht_target_t *ht_intern_target(domain_hashtable_t *ht, const char *name) {
+    for (int i = 0; i < ht->target_count; i++) {
+        if (strcmp(ht->targets[i].name, name) == 0)
+            return &ht->targets[i];
+    }
+    if (ht->target_count == MAX_TARGETS) return NULL;
+    ht_target_t *target = &ht->targets[ht->target_count++];
+    snprintf(target->name, sizeof(target->name), "%s", name);
+    target->rank = MAX_TARGETS;
+    return target;
+}
+
+void ht_rank_targets(domain_hashtable_t *ht, const char (*order)[64], int count) {
+    for (int i = 0; i < count; i++) {
+        ht_target_t *target = ht_intern_target(ht, order[i]);
+        if (target) target->rank = i;
+    }
+}
+
+int ht_insert(domain_hashtable_t *ht, const char *domain, size_t domain_len, const char *ipset_name) {
     uint32_t h = fnv1a_hash(domain, domain_len) & (DOMAIN_HT_BUCKETS - 1);
 
     for (domain_node_t *node = ht->buckets[h]; node; node = node->next) {
         if (node->domain_len == domain_len && memcmp(node->domain, domain, domain_len) == 0)
             return 0;
     }
+
+    const ht_target_t *target = ht_intern_target(ht, ipset_name);
+    if (!target) return -1;
 
     domain_node_t *node = ht_pool_alloc(ht, sizeof(domain_node_t));
     if (!node) return -1;
@@ -66,39 +88,18 @@ int ht_insert(domain_hashtable_t *ht, const char *domain, size_t domain_len, con
     if (!node->domain) return -1;
     node->domain_len = domain_len;
 
-    char *cached_ptr = NULL;
-    for (int i = 0; i < ht->ipset_name_count; i++) {
-        if (strcmp(ht->ipset_name_cache[i], ipset_name) == 0) {
-            cached_ptr = ht->ipset_name_ptrs[i];
-            break;
-        }
-    }
-
-    if (cached_ptr) {
-        node->entry.ipset_name = cached_ptr;
-    } else {
-        node->entry.ipset_name = ht_pool_strdup(ht, ipset_name, strlen(ipset_name));
-        if (!node->entry.ipset_name) return -1;
-        if (ht->ipset_name_count < MAX_POLICY_ORDER) {
-            strncpy(ht->ipset_name_cache[ht->ipset_name_count], ipset_name, 63);
-            ht->ipset_name_cache[ht->ipset_name_count][63] = '\0';
-            ht->ipset_name_ptrs[ht->ipset_name_count] = node->entry.ipset_name;
-            ht->ipset_name_count++;
-        }
-    }
-
-    node->entry.match_subs = match_subs;
+    node->target = target;
     node->next = ht->buckets[h];
     ht->buckets[h] = node;
     ht->count++;
     return 1;
 }
 
-domain_entry_t *ht_lookup(const domain_hashtable_t *ht, const char *domain, size_t domain_len) {
+const ht_target_t *ht_lookup(const domain_hashtable_t *ht, const char *domain, size_t domain_len) {
     uint32_t h = fnv1a_hash(domain, domain_len) & (DOMAIN_HT_BUCKETS - 1);
     for (domain_node_t *node = ht->buckets[h]; node; node = node->next) {
         if (node->domain_len == domain_len && memcmp(node->domain, domain, domain_len) == 0)
-            return &node->entry;
+            return node->target;
     }
     return NULL;
 }

@@ -197,7 +197,7 @@ int param_apply(config_t *cfg, const param_def_t *p, const char *val, int strict
 
     case PT_REPEAT_PATH: {
         int *cnt = (int *)((char *)cfg + p->cfg_count_offset);
-        if (*cnt >= MAX_GEO_FILES) return 0;
+        if (val[0] == '\0' || *cnt >= MAX_GEO_FILES) return 0;
         char (*arr)[MAX_PATH_LEN] = (char (*)[MAX_PATH_LEN])field;
         strncpy(arr[*cnt], val, p->buf_size - 1);
         arr[*cnt][p->buf_size - 1] = '\0';

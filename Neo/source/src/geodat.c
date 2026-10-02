@@ -448,7 +448,7 @@ int build_geosite_domain_map(const char (*file_paths)[512], int file_count,
             else if (all_domains[i].type == GEOSITE_TYPE_DOMAIN ||
                      all_domains[i].type == GEOSITE_TYPE_FULL) {
                 ht_insert(ht, all_domains[i].value, strlen(all_domains[i].value),
-                          rules[r].policy_name, 1);
+                          rules[r].policy_name);
                 inserted++;
             }
         }

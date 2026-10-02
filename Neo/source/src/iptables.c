@@ -5,63 +5,55 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
-#include <unistd.h>
 
-static void get_br0_global_ipv6(char *ipv6_net, int ipv6_size) {
-    ipv6_net[0] = '\0';
+typedef struct {
+    char mark[16];
+    int  xmark, restore;
+} rule_state_t;
 
-    char *argv[] = {"ip", "addr", "show", "br0", NULL};
-    char output[4096];
-    if (run_command_output("ip", argv, output, sizeof(output)) != 0) {
-        LOG_ERROR("ip addr show br0 failed");
-        return;
+typedef struct {
+    rule_state_t fam[2];
+    char mark[16];
+    int  gone;
+} target_state_t;
+
+static const char *next_set_rule(const char **cursor, const char *pattern, size_t *len) {
+    while (*cursor && **cursor) {
+        const char *line = *cursor;
+        const char *nl = strchr(line, '\n');
+        *len = nl ? (size_t)(nl - line) : strlen(line);
+        *cursor = nl ? nl + 1 : NULL;
+        if (line_find(line, *len, "-A PREROUTING ") == line && line_find(line, *len, pattern))
+            return line;
     }
-
-    char *saveptr;
-    char *line = strtok_r(output, "\n", &saveptr);
-    while (line) {
-        while (*line == ' ' || *line == '\t') line++;
-        if (strncmp(line, "inet6 ", 6) == 0 && strstr(line, "scope global")) {
-            char *addr = line + 6;
-            char *sp = strchr(addr, ' ');
-            if (sp) *sp = '\0';
-            strncpy(ipv6_net, addr, ipv6_size - 1);
-            ipv6_net[ipv6_size - 1] = '\0';
-            return;
-        }
-        line = strtok_r(NULL, "\n", &saveptr);
-    }
+    return NULL;
 }
 
-static int find_mark_in_rules(const char *dump, const char *ipset_name,
-                              char *mark_out, size_t mark_size) {
-    char match_pattern[128];
-    snprintf(match_pattern, sizeof(match_pattern), "--match-set %s dst", ipset_name);
+static void scan_rules(const char *dump, const char *set_name, rule_state_t *st) {
+    char pattern[128];
+    snprintf(pattern, sizeof(pattern), "--match-set %s dst ", set_name);
+    st->xmark = st->restore = 0;
 
-    const char *line = dump;
-    while (line && *line) {
-        const char *nl = strchr(line, '\n');
-        size_t len = nl ? (size_t)(nl - line) : strlen(line);
-
-        if (line_find(line, len, "-A PREROUTING ") == line &&
-            line_find(line, len, match_pattern)) {
-            const char *xmark = line_find(line, len, "--set-xmark ");
-            if (xmark) {
-                xmark += 12;
-                if (xmark[0] == '0' && (xmark[1] == 'x' || xmark[1] == 'X'))
-                    xmark += 2;
-                const char *slash = line_find(xmark, len - (size_t)(xmark - line), "/");
-                size_t mlen = slash ? (size_t)(slash - xmark) : 0;
-                if (mlen > 0 && mlen < mark_size) {
-                    memcpy(mark_out, xmark, mlen);
-                    mark_out[mlen] = '\0';
-                    return 1;
-                }
-            }
+    size_t len;
+    const char *cur = dump, *line;
+    while ((line = next_set_rule(&cur, pattern, &len))) {
+        if (line_find(line, len, "--restore-mark")) {
+            st->restore = 1;
+            continue;
         }
-        line = nl ? nl + 1 : NULL;
+        const char *xmark = line_find(line, len, "--set-xmark ");
+        if (st->xmark || !xmark) continue;
+        xmark += 12;
+        if (xmark[0] == '0' && (xmark[1] == 'x' || xmark[1] == 'X'))
+            xmark += 2;
+        const char *slash = line_find(xmark, len - (size_t)(xmark - line), "/");
+        size_t mlen = slash ? (size_t)(slash - xmark) : 0;
+        if (mlen > 0 && mlen < sizeof(st->mark)) {
+            memcpy(st->mark, xmark, mlen);
+            st->mark[mlen] = '\0';
+            st->xmark = 1;
+        }
     }
-    return 0;
 }
 
 void iptables_delete_rules_matching(const char *ipt_cmd, const char *chain,
@@ -130,6 +122,7 @@ typedef struct {
     char batch[IPT_BATCH_SIZE];
     int  off;
     int  rule_count;
+    int  rebuild;
 } connmark_family_t;
 
 static const char *const DUMP_CHAINS[] = {"PREROUTING", "FORWARD", "OUTPUT"};
@@ -163,16 +156,53 @@ static int batch_append(connmark_family_t *fam, const char *fmt, ...) {
     return 0;
 }
 
+static int batch_delete_rules(connmark_family_t *fam, const char *set_name) {
+    char pattern[128];
+    snprintf(pattern, sizeof(pattern), "--match-set %s dst ", set_name);
+
+    int found = 0;
+    size_t len;
+    const char *cur = fam->dump, *line;
+    while ((line = next_set_rule(&cur, pattern, &len))) {
+        if (batch_append(fam, "-D%.*s\n", (int)len - 2, line + 2) != 0) return -1;
+        found = 1;
+    }
+    fam->rule_count += found;
+    return 0;
+}
+
+static inline const char *family_set(const unified_target_t *t, int fi) {
+    return fi ? t->pair.ipv6 : t->pair.ipv4;
+}
+
+static int resolve_mark(const unified_target_t *t, int need_rci, target_state_t *ts) {
+    if (t->is_interface) {
+        snprintf(ts->mark, sizeof(ts->mark), "%x", t->fwmark);
+        return 0;
+    }
+    if (!need_rci) return 0;
+    int r = rci_get_policy_mark(t->pair.ipv4, ts->mark, sizeof(ts->mark));
+    if (r == RCI_MARK_OK) return 0;
+    if (r == RCI_MARK_TRANSPORT) {
+        LOG_WARN("RCI unreachable while reading policy %s", t->pair.ipv4);
+    } else if (r == RCI_MARK_DENIED) {
+        LOG_WARN("RCI denied reading policy %s: access token required or rejected",
+                 t->pair.ipv4);
+    } else {
+        LOG_WARN("Policy %s has no mark ID yet", t->pair.ipv4);
+        ts->gone = 1;
+    }
+    return -1;
+}
+
 int apply_unified_connmark_rules(const unified_target_t *targets, int count,
                                  const config_t *cfg, const char *l7_wan) {
     static int startup_audit = 1;
-
-    char ipv6_net[64];
-    get_br0_global_ipv6(ipv6_net, sizeof(ipv6_net));
+    static connmark_family_t fams[2];
+    static target_state_t states[MAX_TARGETS];
 
     int incomplete = 0;
 
-    static connmark_family_t fams[2];
     fams[0].ipt_cmd = "iptables";  fams[0].restore_cmd = "iptables-restore";
     fams[1].ipt_cmd = "ip6tables"; fams[1].restore_cmd = "ip6tables-restore";
 
@@ -183,84 +213,74 @@ int apply_unified_connmark_rules(const unified_target_t *targets, int count,
         if (dump_chains(fam, chain_count) != 0) return -1;
         fam->off = 0;
         fam->rule_count = 0;
+        fam->rebuild = startup_audit;
         if (batch_append(fam, "*mangle\n") != 0) return -1;
+    }
+
+    for (int i = 0; i < count; i++) {
+        const unified_target_t *t = &targets[i];
+        target_state_t *ts = &states[i];
+        int need_rci = startup_audit, broken[2] = {0, 0};
+        ts->mark[0] = '\0';
+        ts->gone = 0;
+
+        for (int fi = 0; fi < 2; fi++) {
+            rule_state_t *st = &ts->fam[fi];
+            scan_rules(fams[fi].dump, family_set(t, fi), st);
+            broken[fi] = !st->xmark || !st->restore;
+            if (!st->xmark) need_rci = 1;
+        }
+        if (!startup_audit && !broken[0] && !broken[1]) continue;
+        if (resolve_mark(t, need_rci, ts) != 0) incomplete = 1;
+
+        for (int fi = 0; fi < 2; fi++) {
+            if (!broken[fi] || fams[fi].rebuild) continue;
+            if (!ts->mark[0] && !ts->fam[fi].xmark) continue;
+            LOG_INFO("%s: rules for %s are missing, rebuilding all CONNMARK rules in PolicyOrder",
+                     fams[fi].ipt_cmd, family_set(t, fi));
+            fams[fi].rebuild = 1;
+        }
+    }
+
+    for (int fi = 0; fi < 2; fi++) {
+        if (!fams[fi].rebuild) continue;
+        for (int i = 0; i < count; i++)
+            if (batch_delete_rules(&fams[fi], family_set(&targets[i], fi)) != 0) return -1;
     }
 
     const char *pkt_cond = cfg->global_routing ? "" : "-m mark ! --mark 0xffffaa0/0xffffff0 ";
 
     for (int i = 0; i < count; i++) {
-        const char *set_names[2] = { targets[i].pair.ipv4, targets[i].pair.ipv6 };
-        char present_mark[2][16];
-        int  present[2] = {0, 0}, skip[2] = {0, 0};
-        int  need_mark = startup_audit;
-
-        for (int fi = 0; fi < 2; fi++) {
-            if (fi == 1 && !targets[i].is_interface && ipv6_net[0] == '\0') {
-                skip[fi] = 1;
-                continue;
-            }
-            present[fi] = find_mark_in_rules(fams[fi].dump, set_names[fi],
-                                             present_mark[fi], sizeof(present_mark[fi]));
-            if (!present[fi]) need_mark = 1;
-        }
-        if (!need_mark) continue;
-
-        char mark_hex[16] = {0};
-        if (targets[i].is_interface) {
-            snprintf(mark_hex, sizeof(mark_hex), "%x", targets[i].fwmark);
-        } else {
-            int r = rci_get_policy_mark(set_names[0], mark_hex, sizeof(mark_hex));
-            if (r == RCI_MARK_TRANSPORT) {
-                LOG_WARN("RCI unreachable while reading policy %s", set_names[0]);
-                incomplete = 1;
-                continue;
-            }
-            if (r == RCI_MARK_DENIED) {
-                LOG_WARN("RCI denied reading policy %s: access token required or rejected",
-                         set_names[0]);
-                incomplete = 1;
-                continue;
-            }
-            if (r == RCI_MARK_ABSENT) {
-                LOG_WARN("Policy %s has no mark ID yet", set_names[0]);
-                incomplete = 1;
-                for (int fi = 0; fi < 2; fi++) {
-                    if (skip[fi] || !present[fi]) continue;
-                    char needle[128];
-                    snprintf(needle, sizeof(needle), "--match-set %s ", set_names[fi]);
-                    LOG_INFO("Policy %s is gone, removing orphaned rules for %s",
-                             set_names[0], set_names[fi]);
-                    iptables_delete_rules_matching(fams[fi].ipt_cmd, "PREROUTING",
-                                                   needle, NULL);
-                }
-                continue;
-            }
-        }
+        const unified_target_t *t = &targets[i];
+        const target_state_t *ts = &states[i];
 
         for (int fi = 0; fi < 2; fi++) {
             connmark_family_t *fam = &fams[fi];
-            const char *set_name = set_names[fi];
+            const rule_state_t *st = &ts->fam[fi];
+            const char *set_name = family_set(t, fi);
 
-            if (skip[fi]) continue;
-            if (present[fi]) {
-                if (!startup_audit) continue;
-                if (strcmp(present_mark[fi], mark_hex) == 0) continue;
-                char needle[128];
-                snprintf(needle, sizeof(needle), "--match-set %s ", set_name);
-                LOG_INFO("Mark changed for %s: %s -> %s, recreating",
-                         set_name, present_mark[fi], mark_hex);
-                iptables_delete_rules_matching(fam->ipt_cmd, "PREROUTING", needle, NULL);
+            if (ts->gone) {
+                if (!st->xmark && !st->restore) continue;
+                LOG_INFO("Policy %s is gone, removing orphaned rules for %s",
+                         t->pair.ipv4, set_name);
+                if (!fam->rebuild && batch_delete_rules(fam, set_name) != 0) return -1;
+                continue;
             }
+            if (!fam->rebuild) continue;
+            const char *mark = ts->mark[0] ? ts->mark : st->xmark ? st->mark : NULL;
+            if (!mark) continue;
+            if (st->xmark && strcmp(st->mark, mark) != 0)
+                LOG_INFO("Mark changed for %s: %s -> %s", set_name, st->mark, mark);
 
             if (batch_append(fam,
                     "-A PREROUTING %s-m connmark --mark 0x0/0xffffffff -m set --match-set %s dst -j CONNMARK --set-xmark 0x%s/0xffffffff\n",
-                    pkt_cond, set_name, mark_hex) != 0) return -1;
+                    pkt_cond, set_name, mark) != 0) return -1;
             if (batch_append(fam,
                     "-A PREROUTING -m set --match-set %s dst -j CONNMARK --restore-mark --nfmask 0xffffffff --ctmask 0xffffffff\n",
                     set_name) != 0) return -1;
             fam->rule_count++;
             LOG_INFO("Adding rules for %s (mark: 0x%s) via %s",
-                     set_name, mark_hex, fam->restore_cmd);
+                     set_name, mark, fam->restore_cmd);
         }
     }
 

@@ -29,6 +29,12 @@ static void print_help(void) {
            "Write Keenetic RCI token to config and exit");
     printf("  %-*s    %s\n", HELP_FLAG_WIDTH, "",
            "adds if absent/empty, overwrites if different, skips if same");
+    printf("  %-*s  %s\n", HELP_FLAG_WIDTH, "--match <name>",
+           "Ask the running daemon which target the name routes to");
+    printf("  %-*s    %s\n", HELP_FLAG_WIDTH, "",
+           "exit code: 0 match, 1 no match, 2 error");
+    printf("  %-*s  %s\n", HELP_FLAG_WIDTH, "--dump",
+           "Print the running daemon's watchlist");
     printf("  %-*s  %s\n", HELP_FLAG_WIDTH, "--version, -v", "Print version and exit");
     printf("  %-*s  %s\n", HELP_FLAG_WIDTH, "--help, -h",    "Print this help and exit");
     printf("\nPriority: CLI flags > config file > built-in defaults\n");
@@ -65,6 +71,19 @@ int args_parse(int argc, char *argv[], cli_args_t *out) {
                 out->genconfig_target[MAX_PATH_LEN - 1] = '\0';
             }
             return 3;
+        }
+        if (strcmp(arg, "--match") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "hrneo: missing value for --match\n");
+                return -1;
+            }
+            out->api_command = "MATCH";
+            out->api_arg = argv[++i];
+            return 5;
+        }
+        if (strcmp(arg, "--dump") == 0) {
+            out->api_command = "DUMP";
+            return 5;
         }
         if (strcmp(arg, "--keenetic") == 0) {
             if (i + 1 >= argc) {

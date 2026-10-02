@@ -7,6 +7,7 @@
 
 #define DEFAULT_CONFIG_PATH       "/opt/etc/HydraRoute/hrneo.conf"
 #define DEFAULT_PID_FILE          "/var/run/hrneo.pid"
+#define WATCHLIST_SOCKET          "/var/run/hrneo.sock"
 #define DEFAULT_API_PORT          79
 #define IPSET_HASH_TYPE           "hash:net"
 #define SOCKET_READ_BUFFER        (1024 * 1024)
@@ -60,6 +61,7 @@
 #define MAX_PATH_LEN        512
 #define MAX_INTERFACE_NAME  32
 #define MAX_INTERFACES      64
+#define MAX_TARGETS         (MAX_POLICY_ORDER + MAX_INTERFACES)
 #define MAX_POLICY_NAME     64
 #define MAX_TAG_LEN         64
 #define MAX_RCI_TOKEN       512
@@ -136,14 +138,14 @@ typedef struct {
 } geosite_rule_t;
 
 typedef struct {
-    char *ipset_name;
-    int match_subs;
-} domain_entry_t;
+    char name[64];
+    int rank;
+} ht_target_t;
 
 typedef struct domain_node {
     char *domain;
     size_t domain_len;
-    domain_entry_t entry;
+    const ht_target_t *target;
     struct domain_node *next;
 } domain_node_t;
 
@@ -158,9 +160,8 @@ typedef struct {
     int count;
     pool_chunk_t *pool_head;
     pool_chunk_t *pool_tail;
-    char  ipset_name_cache[MAX_POLICY_ORDER][64];
-    char *ipset_name_ptrs[MAX_POLICY_ORDER];
-    int   ipset_name_count;
+    ht_target_t targets[MAX_TARGETS];
+    int target_count;
 } domain_hashtable_t;
 
 static inline uint32_t fnv1a_hash(const char *str, size_t len) {

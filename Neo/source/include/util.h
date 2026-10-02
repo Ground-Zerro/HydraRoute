@@ -7,8 +7,9 @@
 
 domain_hashtable_t *ht_create(void);
 void ht_destroy(domain_hashtable_t *ht);
-int ht_insert(domain_hashtable_t *ht, const char *domain, size_t domain_len, const char *ipset_name, int match_subs);
-domain_entry_t *ht_lookup(const domain_hashtable_t *ht, const char *domain, size_t domain_len);
+void ht_rank_targets(domain_hashtable_t *ht, const char (*order)[64], int count);
+int ht_insert(domain_hashtable_t *ht, const char *domain, size_t domain_len, const char *ipset_name);
+const ht_target_t *ht_lookup(const domain_hashtable_t *ht, const char *domain, size_t domain_len);
 
 void to_lower_inplace(char *s, size_t len);
 char *trim_whitespace(char *s);

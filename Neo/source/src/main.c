@@ -4,6 +4,7 @@
 #include "../include/log.h"
 #include "../include/util.h"
 #include "../include/watchlist.h"
+#include "../include/watchlist_api.h"
 #include "../include/ipset_nl.h"
 #include "../include/dns.h"
 #include "../include/packet_capture.h"
@@ -35,7 +36,7 @@ static ipset_manager_t g_ipset_mgr;
 static volatile int g_shutdown;
 static direct_route_manager_t g_drm;
 static int g_drm_active;
-static unified_target_t g_all_sorted[MAX_POLICY_ORDER + MAX_INTERFACES];
+static unified_target_t g_all_sorted[MAX_TARGETS];
 static int g_all_sorted_count;
 static conntrack_mgr_t g_conntrack = { .fd = -1, .del_fd = -1 };
 static nflog_capture_t g_nflog;
@@ -118,9 +119,7 @@ static int process_hostname_event(const char *domain,
                                    const char *source_tag, int allow_conntrack_flush) {
     const char *matched_domain = NULL;
     const char *ipset_name = match_domain_with_cname(
-        g_all_targets,
-        (const char (*)[64])g_config.policy_order, g_config.policy_order_count,
-        domain, cnames, cname_count, &matched_domain);
+        g_all_targets, domain, cnames, cname_count, &matched_domain);
 
     if (!ipset_name) return 0;
 
@@ -318,6 +317,7 @@ int main(int argc, char *argv[]) {
             return 1;
         }
     }
+    if (ar == 5) return wlapi_request(WATCHLIST_SOCKET, args.api_command, args.api_arg);
     if (ar > 0) return 0;
     if (ar < 0) return 1;
 
@@ -399,11 +399,16 @@ int main(int argc, char *argv[]) {
     }
 
     geosite_rule_t gs_rules[256];
-    int gs_count = 0;
-    if (g_config.geo_site_file_count > 0) {
+    int gs_count = parse_geosite_rules(g_config.watchlist_path, gs_rules, 256);
+    if (gs_count < 0) gs_count = 0;
+    if (g_config.geo_site_file_count == 0) {
+        for (int i = 0; i < gs_count; i++)
+            LOG_WARN("GeoSite directive 'geosite:%s' found but GeoSiteFile not configured",
+                     gs_rules[i].tag);
+        gs_count = 0;
+    }
+    {
         int pc_before = policy_count;
-        gs_count = parse_geosite_rules(g_config.watchlist_path, gs_rules, 256);
-        if (gs_count < 0) gs_count = 0;
         for (int i = 0; i < gs_count; i++) {
             if (g_drm_active && drm_classify_target(&g_drm, gs_rules[i].policy_name))
                 add_unique_name(iface_names, &iface_count, gs_rules[i].policy_name, MAX_INTERFACES);
@@ -426,7 +431,7 @@ int main(int argc, char *argv[]) {
                   (const char (*)[64])g_config.policy_order, g_config.policy_order_count);
 
     {
-        char all_names[MAX_POLICY_ORDER + MAX_INTERFACES][64];
+        char all_names[MAX_TARGETS][64];
         int all_count = 0;
         for (int i = 0; i < policy_count; i++) {
             strncpy(all_names[all_count], policy_names[i], 63);
@@ -440,6 +445,7 @@ int main(int argc, char *argv[]) {
         }
         sort_policies(all_names, all_count,
                       (const char (*)[64])g_config.policy_order, g_config.policy_order_count);
+        ht_rank_targets(g_all_targets, (const char (*)[64])all_names, all_count);
 
         g_all_sorted_count = all_count;
         for (int i = 0; i < all_count; i++) {
@@ -487,7 +493,7 @@ int main(int argc, char *argv[]) {
         g_ipset_mgr.default_timeout =
             (g_config.ipset_enable_timeout && g_config.ipset_timeout > 0)
                 ? (uint32_t)g_config.ipset_timeout : 0;
-        ipset_pair_t init_pairs[MAX_POLICY_ORDER + MAX_INTERFACES];
+        ipset_pair_t init_pairs[MAX_TARGETS];
         for (int i = 0; i < g_all_sorted_count; i++)
             init_pairs[i] = g_all_sorted[i].pair;
         initialize_ipsets(&g_ipset_mgr, init_pairs, g_all_sorted_count,
@@ -618,6 +624,8 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    wlapi_start(WATCHLIST_SOCKET, g_all_targets);
+
     LOG_INFO("Packet capture started, waiting for DNS responses...");
 
     commit_start(&signals);
@@ -666,6 +674,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    wlapi_stop();
     if (reasm_gc_fd >= 0) close(reasm_gc_fd);
     close(epfd);
 
@@ -692,7 +701,7 @@ cleanup_conntrack:
         drm_cleanup_all_routes(&g_drm);
     }
     {
-        ipset_pair_t cleanup_pairs[MAX_POLICY_ORDER + MAX_INTERFACES];
+        ipset_pair_t cleanup_pairs[MAX_TARGETS];
         for (int i = 0; i < g_all_sorted_count; i++)
             cleanup_pairs[i] = g_all_sorted[i].pair;
         cleanup_connmark_rules(cleanup_pairs, g_all_sorted_count);

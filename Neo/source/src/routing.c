@@ -378,7 +378,7 @@ static int classify_on_target(const char *target, void *user) {
 static void classify_on_domain(const char *target, const char *domain,
                                 size_t domain_len, void *user) {
     classify_ctx_t *cx = (classify_ctx_t *)user;
-    ht_insert(cx->all_targets, domain, domain_len, target, 1);
+    ht_insert(cx->all_targets, domain, domain_len, target);
 }
 
 int parse_watchlist_classified(const char *path, direct_route_manager_t *drm,

@@ -428,14 +428,16 @@ int rci_get_policy_mark(const char *name, char *mark, int mark_size) {
     return RCI_MARK_OK;
 }
 
+#define RCI_POLICY_CREATE_FMT "{\"ip\":{\"policy\":{\"%s\":{\"description\":\"%s\"}}}},"
+
 int rci_create_policies(const char (*names)[64], int count) {
     if (count == 0) return 0;
 
-    char body[8192];
+    char body[MAX_POLICY_ORDER * (sizeof(RCI_POLICY_CREATE_FMT) + 2 * 64) + 64];
     int off = snprintf(body, sizeof(body), "[");
     for (int i = 0; i < count; i++) {
         off += snprintf(body + off, sizeof(body) - off,
-                        "{\"parse\":\"ip policy %s\"},", names[i]);
+                        RCI_POLICY_CREATE_FMT, names[i], names[i]);
     }
     off += snprintf(body + off, sizeof(body) - off,
                     "{\"system\":{\"configuration\":{\"save\":true}}}]");
