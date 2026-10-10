@@ -19,6 +19,9 @@
 #include "../include/l7_firewall.h"
 #include "../include/tcp_reasm.h"
 #include <sys/timerfd.h>
+#include <sys/eventfd.h>
+#include <poll.h>
+#include <time.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -29,6 +32,9 @@
 #include <signal.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <ifaddrs.h>
+
+#define MAX_LOCAL_ADDRS 64
 
 static config_t g_config;
 static domain_hashtable_t *g_all_targets;
@@ -44,11 +50,19 @@ static int g_l7_active;
 static char g_l7_wan[MAX_INTERFACE_NAME];
 static tcp_reasm_t g_reasm;
 static int g_reasm_active;
-static int g_commit_active;
 static const char *g_cfg_path = DEFAULT_CONFIG_PATH;
 static char g_policy_names[MAX_POLICY_ORDER][64];
 static int g_policy_names_count;
 static int g_policies_pending;
+
+static struct {
+    pthread_t thread;
+    int running;
+    int req_fd;
+    int timer_fd;
+    int stop_fd;
+    int heal_fd;
+} g_nf = { .req_fd = -1, .timer_fd = -1, .stop_fd = -1, .heal_fd = -1 };
 
 static int create_pid_file(const char *path) {
     FILE *f = fopen(path, "r");
@@ -102,6 +116,47 @@ static int initialize_ipsets(ipset_manager_t *mgr, const ipset_pair_t *pairs, in
     return 0;
 }
 
+static struct {
+    uint8_t ip[16];
+    uint8_t family;
+} g_local_addrs[MAX_LOCAL_ADDRS];
+static int g_local_addr_count;
+
+static void snapshot_local_addrs(void) {
+    struct ifaddrs *list;
+    g_local_addr_count = 0;
+    if (getifaddrs(&list) != 0) return;
+    for (struct ifaddrs *a = list; a && g_local_addr_count < MAX_LOCAL_ADDRS; a = a->ifa_next) {
+        if (!a->ifa_addr) continue;
+        int family = a->ifa_addr->sa_family;
+        if (family == AF_INET)
+            memcpy(g_local_addrs[g_local_addr_count].ip, &((struct sockaddr_in *)a->ifa_addr)->sin_addr, 4);
+        else if (family == AF_INET6)
+            memcpy(g_local_addrs[g_local_addr_count].ip, &((struct sockaddr_in6 *)a->ifa_addr)->sin6_addr, 16);
+        else
+            continue;
+        g_local_addrs[g_local_addr_count++].family = (uint8_t)family;
+    }
+    freeifaddrs(list);
+}
+
+static int heal_match(int family, const uint8_t *dst_ip) {
+    int ip_len = family == AF_INET ? 4 : 16;
+    for (int i = 0; i < g_local_addr_count; i++)
+        if (g_local_addrs[i].family == family && memcmp(g_local_addrs[i].ip, dst_ip, ip_len) == 0)
+            return 0;
+    parsed_cidr_t e;
+    memset(&e, 0, sizeof(e));
+    memcpy(e.ip, dst_ip, ip_len);
+    e.family = (uint8_t)family;
+    e.prefix = (uint8_t)(ip_len * 8);
+    for (int i = 0; i < g_all_sorted_count; i++)
+        if (ipset_test(&g_ipset_mgr, family == AF_INET ? g_all_sorted[i].pair.ipv4
+                                                       : g_all_sorted[i].pair.ipv6, &e))
+            return 1;
+    return 0;
+}
+
 static void format_ipv4(const uint8_t *ip, char *buf, int buf_size) {
     snprintf(buf, buf_size, "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
 }
@@ -118,10 +173,11 @@ static int process_hostname_event(const char *domain,
                                    const parsed_cidr_t *ipv6_batch, int ipv6_count,
                                    const char *source_tag, int allow_conntrack_flush) {
     const char *matched_domain = NULL;
-    const char *ipset_name = match_domain_with_cname(
+    const ht_target_t *target = match_domain_with_cname(
         g_all_targets, domain, cnames, cname_count, &matched_domain);
 
-    if (!ipset_name) return 0;
+    if (!target) return 0;
+    const char *ipset_name = target->name;
 
     if (matched_domain && matched_domain != domain)
         LOG_MATCH("[%s] %s via %s -> %s", source_tag, domain, matched_domain, ipset_name);
@@ -135,7 +191,7 @@ static int process_hostname_event(const char *domain,
         int new_count = 0;
         int new_indices[32];
         ipset_add_batch(&g_ipset_mgr, ipset_name,
-                        ipv4_batch, ipv4_count, 1, &new_count, new_indices);
+                        ipv4_batch, ipv4_count, target->rank, &new_count, new_indices);
         for (int k = 0; k < new_count; k++) {
             char ip_str[INET_ADDRSTRLEN];
             format_ipv4(ipv4_batch[new_indices[k]].ip, ip_str, sizeof(ip_str));
@@ -151,7 +207,7 @@ static int process_hostname_event(const char *domain,
         int new_count = 0;
         int new_indices[32];
         ipset_add_batch(&g_ipset_mgr, ipv6_set,
-                        ipv6_batch, ipv6_count, 1, &new_count, new_indices);
+                        ipv6_batch, ipv6_count, target->rank, &new_count, new_indices);
         for (int k = 0; k < new_count; k++) {
             char ip_str[INET6_ADDRSTRLEN];
             format_ipv6(ipv6_batch[new_indices[k]].ip, ip_str, sizeof(ip_str));
@@ -199,7 +255,10 @@ static void process_dns_packet(const uint8_t *pkt, int pkt_len, void *user_data)
     if (!dns) return;
 
     static dns_result_t result;
-    if (dns_parse_response(dns, dns_len, &result) != 0) return;
+    if (dns_parse_response(dns, dns_len, &result) != 0 || result.answer_count == 0) return;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    if (dns_result_repeat(&result, (uint32_t)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000))) return;
 
     char processed[64][256];
     int processed_count = 0;
@@ -247,6 +306,7 @@ static void process_dns_packet(const uint8_t *pkt, int pkt_len, void *user_data)
 }
 
 static int perform_update(void) {
+    int restored;
     rci_auth_recover(g_cfg_path);
 
     if (g_policies_pending)
@@ -261,24 +321,72 @@ static int perform_update(void) {
         drm_handle_state_changes(&g_drm, (const char (*)[2][32])old_states, old_count);
         drm_setup_all_routes(&g_drm);
     }
-    return apply_unified_connmark_rules(g_all_sorted, g_all_sorted_count, &g_config,
-                                        g_l7_active ? g_l7_wan : NULL);
+    int rc = apply_unified_connmark_rules(g_all_sorted, g_all_sorted_count, &g_config,
+                                          g_l7_active ? g_l7_wan : NULL, &restored);
+    if (restored && g_conntrack.fd >= 0)
+        eventfd_write(g_nf.heal_fd, 1);
+    return rc;
 }
 
-static void commit_run(signal_mgr_t *m) {
-    if (perform_update() == 0) {
-        LOG_INFO("netfilter rules committed");
-        g_commit_active = 0;
-        return;
+static void nf_arm_retry(void) {
+    struct itimerspec its = {
+        .it_value = { NF_COMMIT_INTERVAL_MS / 1000, (long)(NF_COMMIT_INTERVAL_MS % 1000) * 1000000L },
+    };
+    timerfd_settime(g_nf.timer_fd, 0, &its, NULL);
+}
+
+static void *nf_worker(void *arg) {
+    int active = 0;
+    struct pollfd fds[3] = {
+        { g_nf.stop_fd, POLLIN, 0 }, { g_nf.req_fd, POLLIN, 0 }, { g_nf.timer_fd, POLLIN, 0 },
+    };
+    for (;;) {
+        if (poll(fds, 3, -1) < 0) continue;
+        if (fds[0].revents) return NULL;
+        uint64_t v;
+        if (fds[1].revents && read(g_nf.req_fd, &v, sizeof(v)) == sizeof(v)) {
+            if (active) {
+                LOG_DEBUG("commit request ignored, commit cycle active");
+            } else {
+                LOG_DEBUG("commit request, committing now");
+                active = 1;
+                perform_update();
+                nf_arm_retry();
+            }
+        }
+        if (fds[2].revents && read(g_nf.timer_fd, &v, sizeof(v)) == sizeof(v)) {
+            if (perform_update() == 0) {
+                LOG_INFO("netfilter rules committed");
+                active = 0;
+            } else {
+                LOG_WARN("netfilter commit incomplete, retry in %d ms", NF_COMMIT_INTERVAL_MS);
+                nf_arm_retry();
+            }
+        }
     }
-    LOG_WARN("netfilter commit incomplete, retry in %d ms", NF_COMMIT_INTERVAL_MS);
-    signal_mgr_arm_timer(m, NF_COMMIT_INTERVAL_MS);
 }
 
-static void commit_start(signal_mgr_t *m) {
-    g_commit_active = 1;
-    perform_update();
-    signal_mgr_arm_timer(m, NF_COMMIT_INTERVAL_MS);
+static int nf_start(void) {
+    g_nf.req_fd = eventfd(0, EFD_CLOEXEC);
+    g_nf.stop_fd = eventfd(0, EFD_CLOEXEC);
+    g_nf.heal_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    g_nf.timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC);
+    if (g_nf.req_fd < 0 || g_nf.stop_fd < 0 || g_nf.heal_fd < 0 || g_nf.timer_fd < 0)
+        return -1;
+    if (thread_start_masked(&g_nf.thread, nf_worker) != 0) return -1;
+    g_nf.running = 1;
+    return 0;
+}
+
+static void nf_stop(void) {
+    if (g_nf.running) {
+        eventfd_write(g_nf.stop_fd, 1);
+        pthread_join(g_nf.thread, NULL);
+        g_nf.running = 0;
+    }
+    int *fds[] = { &g_nf.req_fd, &g_nf.timer_fd, &g_nf.stop_fd, &g_nf.heal_fd };
+    for (size_t i = 0; i < sizeof(fds) / sizeof(fds[0]); i++)
+        if (*fds[i] >= 0) { close(*fds[i]); *fds[i] = -1; }
 }
 
 static void add_unique_name(char names[][64], int *count, const char *name, int max) {
@@ -332,6 +440,7 @@ int main(int argc, char *argv[]) {
     if (ar > 0) return 0;
     if (ar < 0) return 1;
 
+    signal(SIGPIPE, SIG_IGN);
     {
         sigset_t mask;
         sigemptyset(&mask);
@@ -527,7 +636,14 @@ int main(int argc, char *argv[]) {
         drm_setup_all_routes(&g_drm);
     }
 
+    if (g_config.global_routing && !ppe_target_available()) {
+        LOG_ERROR("GlobalRouting needs the PPE iptables target to keep overridden connections off FASTNAT; "
+                  "not found in this firmware, GlobalRouting disabled");
+        g_config.global_routing = 0;
+    }
+
     if (g_config.conntrack_flush) {
+        g_conntrack.heal_match = heal_match;
         if (conntrack_mgr_init(&g_conntrack) != 0) {
             LOG_WARN("conntrack manager init failed; conntrack flush disabled");
             g_config.conntrack_flush = 0;
@@ -547,7 +663,7 @@ int main(int argc, char *argv[]) {
             LOG_WARN("L7 capture: NFLOG kernel modules unavailable; L7 disabled, DNS-only mode");
         } else {
             LOG_INFO("L7 WAN interface: %s", g_l7_wan);
-            l7_firewall_load_kmod("xt_connbytes");
+            load_kmod("xt_connbytes");
             l7_dispatch_set_enable(g_config.l7_enable_tls, g_config.l7_enable_http,
                                    g_config.l7_enable_quic);
 
@@ -588,6 +704,11 @@ int main(int argc, char *argv[]) {
         goto cleanup_capture;
     }
 
+    if (nf_start() != 0) {
+        LOG_ERROR("Failed to start netfilter committer");
+        goto cleanup_signals;
+    }
+
     int epfd = epoll_create1(EPOLL_CLOEXEC);
     if (epfd < 0) {
         LOG_ERROR("epoll_create failed");
@@ -604,12 +725,11 @@ int main(int argc, char *argv[]) {
     ev.data.fd = signals.sig_fd;
     epoll_ctl(epfd, EPOLL_CTL_ADD, signals.sig_fd, &ev);
 
-    ev.data.fd = signals.timer_fd;
-    epoll_ctl(epfd, EPOLL_CTL_ADD, signals.timer_fd, &ev);
-
     if (g_conntrack.fd >= 0) {
         ev.data.fd = g_conntrack.fd;
         epoll_ctl(epfd, EPOLL_CTL_ADD, g_conntrack.fd, &ev);
+        ev.data.fd = g_nf.heal_fd;
+        epoll_ctl(epfd, EPOLL_CTL_ADD, g_nf.heal_fd, &ev);
     }
 
     int nflog_fd = -1;
@@ -637,7 +757,7 @@ int main(int argc, char *argv[]) {
 
     LOG_INFO("Packet capture started, waiting for DNS responses...");
 
-    commit_start(&signals);
+    eventfd_write(g_nf.req_fd, 1);
 
     struct epoll_event events[8];
     while (!g_shutdown) {
@@ -668,17 +788,15 @@ int main(int argc, char *argv[]) {
                         LOG_INFO("Received signal %d, shutting down...", si.ssi_signo);
                         g_shutdown = 1;
                     } else if (si.ssi_signo == SIGUSR1) {
-                        if (g_commit_active) {
-                            LOG_DEBUG("SIGUSR1 ignored, commit cycle active");
-                        } else {
-                            LOG_DEBUG("SIGUSR1 received, committing now");
-                            commit_start(&signals);
-                        }
+                        eventfd_write(g_nf.req_fd, 1);
                     }
                 }
-            } else if (events[i].data.fd == signals.timer_fd) {
-                signal_mgr_read_timer(&signals);
-                commit_run(&signals);
+            } else if (events[i].data.fd == g_nf.heal_fd) {
+                uint64_t v;
+                if (read(g_nf.heal_fd, &v, sizeof(v)) == sizeof(v)) {
+                    snapshot_local_addrs();
+                    conntrack_heal_request(&g_conntrack);
+                }
             }
         }
     }
@@ -688,6 +806,7 @@ int main(int argc, char *argv[]) {
     close(epfd);
 
 cleanup_signals:
+    nf_stop();
     signal_mgr_close(&signals);
 
 cleanup_capture:
@@ -709,12 +828,7 @@ cleanup_conntrack:
     if (g_drm_active) {
         drm_cleanup_all_routes(&g_drm);
     }
-    {
-        ipset_pair_t cleanup_pairs[MAX_TARGETS];
-        for (int i = 0; i < g_all_sorted_count; i++)
-            cleanup_pairs[i] = g_all_sorted[i].pair;
-        cleanup_connmark_rules(cleanup_pairs, g_all_sorted_count);
-    }
+    cleanup_connmark_rules(g_config.global_routing);
     ipset_manager_close(&g_ipset_mgr);
 
 cleanup:

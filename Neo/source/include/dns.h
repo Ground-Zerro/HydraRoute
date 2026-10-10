@@ -11,6 +11,8 @@
 
 #define DNS_MAX_ANSWERS 128
 #define DNS_MAX_CNAMES  32
+#define DNS_REPEAT_RING 32
+#define DNS_REPEAT_WINDOW_MS 2000
 
 typedef struct {
     char domain[256];
@@ -32,5 +34,6 @@ typedef struct {
 
 const uint8_t *extract_dns_payload(const uint8_t *pkt, int pkt_len, int *dns_len);
 int dns_parse_response(const uint8_t *dns_data, int dns_len, dns_result_t *result);
+int dns_result_repeat(const dns_result_t *result, uint32_t now_ms);
 
 #endif

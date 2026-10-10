@@ -81,14 +81,10 @@ static int dns_decode_name(const uint8_t *dns_data, int dns_len, int offset, cha
         offset++;
         if (offset + label_len > dns_len) return -1;
 
-        if (name_len > 0 && name_len < max_len - 1) {
-            out_name[name_len++] = '.';
-        }
-
-        int copy_len = label_len;
-        if (name_len + copy_len >= max_len) copy_len = max_len - name_len - 1;
-        memcpy(out_name + name_len, dns_data + offset, copy_len);
-        name_len += copy_len;
+        if (name_len + (name_len > 0) + label_len >= max_len) return -1;
+        if (name_len > 0) out_name[name_len++] = '.';
+        memcpy(out_name + name_len, dns_data + offset, label_len);
+        name_len += label_len;
         offset += label_len;
     }
 
@@ -174,5 +170,34 @@ int dns_parse_response(const uint8_t *dns_data, int dns_len, dns_result_t *resul
         offset += rdlength;
     }
 
+    return 0;
+}
+
+static uint64_t mix64(uint64_t h) {
+    h ^= h >> 33; h *= 0xff51afd7ed558ccdull;
+    h ^= h >> 33; h *= 0xc4ceb9fe1a85ec53ull;
+    return h ^ (h >> 33);
+}
+
+static uint64_t pair_hash(const char *a, const void *b, size_t blen) {
+    return mix64((uint64_t)fnv1a_hash(a, strlen(a)) << 32 | fnv1a_hash(b, blen));
+}
+
+int dns_result_repeat(const dns_result_t *r, uint32_t now_ms) {
+    static struct { uint64_t key; uint32_t at; } ring[DNS_REPEAT_RING];
+    static unsigned pos;
+
+    uint64_t key = mix64((uint64_t)r->answer_count << 32 | (uint32_t)r->cname_count);
+    for (int i = 0; i < r->answer_count; i++)
+        key += pair_hash(r->answers[i].domain, r->answers[i].ip,
+                         r->answers[i].family == AF_INET ? 4 : 16);
+    for (int i = 0; i < r->cname_count; i++)
+        key += pair_hash(r->cnames[i].source, r->cnames[i].target, strlen(r->cnames[i].target));
+
+    for (int i = 0; i < DNS_REPEAT_RING; i++)
+        if (ring[i].key == key && now_ms - ring[i].at < DNS_REPEAT_WINDOW_MS) return 1;
+    ring[pos % DNS_REPEAT_RING].key = key;
+    ring[pos % DNS_REPEAT_RING].at = now_ms;
+    pos++;
     return 0;
 }

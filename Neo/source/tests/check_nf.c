@@ -50,6 +50,22 @@ static void check_emit_from_empty(void) {
     assert(strstr(out, "--connbytes 2:8 "));
     assert(strstr(out, "--connbytes 2:4 "));
     assert(strstr(out, "--nflog-group 210\n"));
+    assert(strstr(out, "-A FORWARD -o eth3 -p udp --dport 443 -m connbytes --connbytes-dir original "
+                       "--connbytes-mode packets --connbytes 0:3 -m length --length 1200: "));
+}
+
+static void check_emit_quic_window(void) {
+    config_t cfg = make_cfg();
+    const char *unbounded =
+        "-A FORWARD -o eth3 -p udp -m udp --dport 443 -m length --length 1200:65535 -j NFLOG --nflog-group 210\n"
+        "-A OUTPUT -o eth3 -p udp -m udp --dport 443 -m connbytes --connbytes 0:3 "
+        "--connbytes-mode packets --connbytes-dir original -m length --length 1200:65535 -j NFLOG --nflog-group 210\n";
+    char out[4096];
+    int n = l7_firewall_emit_rules(&cfg, "eth3", unbounded, out, sizeof(out));
+    assert(n > 0);
+    out[n] = '\0';
+    assert(strstr(out, "-A FORWARD -o eth3 -p udp --dport 443 "));
+    assert(!strstr(out, "-A OUTPUT -o eth3 -p udp "));
 }
 
 static void check_emit_idempotent(void) {
@@ -69,7 +85,7 @@ static void check_emit_partial(void) {
         "-P FORWARD ACCEPT\n"
         "-A FORWARD -o eth3 -p tcp --dport 443 --tcp-flags SYN,ACK ACK "
         "-m connbytes --connbytes 2:8 --connbytes-mode packets --connbytes-dir original "
-        "-m length --length 60: -j NFLOG --nflog-group 210\n";
+        "-m length --length 41: -j NFLOG --nflog-group 210\n";
     char out[4096];
     int n = l7_firewall_emit_rules(&cfg, "eth3", dump, out, sizeof(out));
     assert(n > 0);
@@ -80,6 +96,20 @@ static void check_emit_partial(void) {
     assert(lines == 5);
     assert(!strstr(out, "-A FORWARD -o eth3 -p tcp --dport 443 "));
     assert(strstr(out, "-A OUTPUT -o eth3 -p tcp --dport 443 "));
+}
+
+static void check_emit_old_length(void) {
+    config_t cfg = make_cfg();
+    const char *dump =
+        "-A FORWARD -o eth3 -p tcp -m tcp --dport 443 --tcp-flags SYN,ACK ACK "
+        "-m connbytes --connbytes 2:8 --connbytes-mode packets --connbytes-dir original "
+        "-m length --length 60:65535 -j NFLOG --nflog-group 210\n";
+    char out[4096];
+    int n = l7_firewall_emit_rules(&cfg, "eth3", dump, out, sizeof(out));
+    assert(n > 0);
+    out[n] = '\0';
+    assert(strstr(out, "-A FORWARD -o eth3 -p tcp --dport 443 "));
+    assert(strstr(out, "-m length --length 41: -j NFLOG"));
 }
 
 static void check_emit_wan_specific(void) {
@@ -129,11 +159,12 @@ static void check_emit_concat_dump(void) {
         "-A FORWARD -j NDMMARK --set-xndmmark 0x4/0x0\n"
         "-A FORWARD -o eth3 -p tcp -m tcp --dport 443 --tcp-flags SYN,ACK ACK "
         "-m connbytes --connbytes 2:8 --connbytes-mode packets --connbytes-dir original "
-        "-m length --length 60:65535 -j NFLOG --nflog-group 210\n"
+        "-m length --length 41:65535 -j NFLOG --nflog-group 210\n"
         "-A FORWARD -o eth3 -p tcp -m tcp --dport 80 --tcp-flags SYN,ACK ACK "
         "-m connbytes --connbytes 2:4 --connbytes-mode packets --connbytes-dir original "
-        "-m length --length 60:65535 -j NFLOG --nflog-group 210\n"
-        "-A FORWARD -o eth3 -p udp -m udp --dport 443 -m length --length 1200:65535 "
+        "-m length --length 41:65535 -j NFLOG --nflog-group 210\n"
+        "-A FORWARD -o eth3 -p udp -m udp --dport 443 -m connbytes --connbytes 0:3 "
+        "--connbytes-mode packets --connbytes-dir original -m length --length 1200:65535 "
         "-j NFLOG --nflog-group 210\n"
         "-P OUTPUT ACCEPT\n"
         "-A OUTPUT -j _NDM_OUTPUT_DELAY\n";
@@ -178,10 +209,12 @@ int main(void) {
     check_emit_from_empty();
     check_emit_idempotent();
     check_emit_partial();
+    check_emit_old_length();
     check_emit_wan_specific();
     check_emit_overflow();
     check_emit_no_wan();
     check_emit_no_quic();
+    check_emit_quic_window();
     check_emit_concat_dump();
     printf("check_nf: all assertions passed\n");
     return 0;

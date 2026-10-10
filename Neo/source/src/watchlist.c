@@ -152,10 +152,10 @@ const ht_target_t *watchlist_match(const domain_hashtable_t *ht,
     return best;
 }
 
-const char *match_domain_with_cname(const domain_hashtable_t *ht,
-                                    const char *domain,
-                                    const dns_cname_t *cnames, int cname_count,
-                                    const char **matched_domain) {
+const ht_target_t *match_domain_with_cname(const domain_hashtable_t *ht,
+                                          const char *domain,
+                                          const dns_cname_t *cnames, int cname_count,
+                                          const char **matched_domain) {
     const char *queue[MAX_CNAME_CHAIN];
     uint32_t visited_hashes[MAX_CNAME_CHAIN];
     int head = 0, tail = 0, visited_count = 0;
@@ -193,5 +193,5 @@ const char *match_domain_with_cname(const domain_hashtable_t *ht,
         }
     }
 
-    return best ? best->name : NULL;
+    return best;
 }

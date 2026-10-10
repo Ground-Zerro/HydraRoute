@@ -11,6 +11,7 @@
 
 #define CT_MSG_TYPE_GET    ((CT_NFNL_SUBSYS << 8) | CT_MSG_GET)
 #define CT_MSG_TYPE_DELETE ((CT_NFNL_SUBSYS << 8) | CT_MSG_DELETE)
+#define CT_RECV_BUDGET 8
 
 int conntrack_mgr_init(conntrack_mgr_t *m) {
     struct sockaddr_nl sa;
@@ -38,6 +39,8 @@ int conntrack_mgr_init(conntrack_mgr_t *m) {
 
     m->pending_count = 0;
     m->dump_family = 0;
+    m->dump_heal = 0;
+    m->heal_pending = 0;
     m->rescan = 0;
     m->deleted = 0;
     return 0;
@@ -150,45 +153,83 @@ static int ct_pending_has_family(const conntrack_mgr_t *m, int family) {
     return 0;
 }
 
-static void ct_dump_start(conntrack_mgr_t *m, int family) {
+static void ct_put_attr(uint8_t *buf, int *off, uint16_t type,
+                        const void *data, int len) {
+    struct nlattr *a = (struct nlattr *)(buf + *off);
+    a->nla_type = type;
+    a->nla_len = (uint16_t)(NLA_HDRLEN + len);
+    memcpy(buf + *off + NLA_HDRLEN, data, len);
+    *off += NLA_ALIGN(NLA_HDRLEN + len);
+}
+
+static void ct_dump_start(conntrack_mgr_t *m, int family, int heal) {
     uint8_t req[64];
     memset(req, 0, sizeof(req));
 
     struct nlmsghdr *nlh = (struct nlmsghdr *)req;
     nlh->nlmsg_type = CT_MSG_TYPE_GET;
     nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
-    nlh->nlmsg_len = NLMSG_HDRLEN + 4;
     nlh->nlmsg_seq = 1;
 
     uint8_t *nfgen = req + NLMSG_HDRLEN;
     nfgen[0] = family;
+    int off = NLMSG_HDRLEN + 4;
+    uint32_t zero = 0, all = 0xffffffffu;
+    ct_put_attr(req, &off, CTA_MARK, &zero, 4);
+    ct_put_attr(req, &off, CTA_MARK_MASK, &all, 4);
+    nlh->nlmsg_len = off;
 
     if (send(m->fd, req, nlh->nlmsg_len, 0) < 0) {
         LOG_WARN("conntrack dump send: %s", strerror(errno));
         m->pending_count = 0;
         m->dump_family = 0;
+        m->dump_heal = 0;
+        m->heal_pending = 0;
         m->rescan = 0;
         m->deleted = 0;
         return;
     }
     m->dump_family = family;
+    m->dump_heal = heal;
+}
+
+static void ct_next_dump(conntrack_mgr_t *m) {
+    m->dump_family = 0;
+    m->dump_heal = 0;
+    if (m->pending_count) {
+        m->rescan = 0;
+        ct_dump_start(m, ct_pending_has_family(m, AF_INET) ? AF_INET : AF_INET6, 0);
+    } else if (m->heal_pending) {
+        m->heal_pending = 0;
+        ct_dump_start(m, AF_INET, 1);
+    }
 }
 
 static void ct_dump_finished(conntrack_mgr_t *m) {
-    if (m->dump_family == AF_INET && ct_pending_has_family(m, AF_INET6)) {
-        ct_dump_start(m, AF_INET6);
-        return;
-    }
-    if (m->rescan) {
-        m->rescan = 0;
-        ct_dump_start(m, ct_pending_has_family(m, AF_INET) ? AF_INET : AF_INET6);
-        return;
-    }
     if (m->deleted > 0)
-        LOG_DEBUG("conntrack: deleted %d entries", m->deleted);
-    m->pending_count = 0;
-    m->dump_family = 0;
+        LOG_DEBUG("conntrack%s: deleted %d entries", m->dump_heal ? " heal" : "", m->deleted);
     m->deleted = 0;
+    if (m->dump_heal) {
+        if (m->dump_family == AF_INET) {
+            ct_dump_start(m, AF_INET6, 1);
+            return;
+        }
+    } else {
+        if (m->dump_family == AF_INET && ct_pending_has_family(m, AF_INET6)) {
+            ct_dump_start(m, AF_INET6, 0);
+            return;
+        }
+        if (!m->rescan) m->pending_count = 0;
+    }
+    ct_next_dump(m);
+}
+
+static int ct_pending_match(const conntrack_mgr_t *m, int family, const uint8_t *dst_ip) {
+    int ip_len = (family == AF_INET) ? 4 : 16;
+    for (int i = 0; i < m->pending_count; i++)
+        if (m->pending[i].family == family && memcmp(m->pending[i].ip, dst_ip, ip_len) == 0)
+            return 1;
+    return 0;
 }
 
 void conntrack_process(conntrack_mgr_t *m) {
@@ -196,20 +237,12 @@ void conntrack_process(conntrack_mgr_t *m) {
 
     static uint8_t buf[65536];
 
-    for (;;) {
+    for (int budget = CT_RECV_BUDGET; budget > 0; budget--) {
         int n = recv(m->fd, buf, sizeof(buf), MSG_DONTWAIT);
-        if (n < 0) {
-            if (errno == ENOBUFS) {
-                LOG_DEBUG("conntrack dump overrun");
-                continue;
-            }
-            return;
-        }
-        if (n == 0) return;
+        if (n <= 0) return;
 
         int family = m->dump_family;
         if (family == 0) continue;
-        int ip_len = (family == AF_INET) ? 4 : 16;
 
         int offset = 0;
         while (offset + (int)NLMSG_HDRLEN <= n) {
@@ -233,15 +266,11 @@ void conntrack_process(conntrack_mgr_t *m) {
                 memset(dst_ip, 0, sizeof(dst_ip));
 
                 if (ct_extract_orig_tuple(data, data_len, family,
-                                          &orig_raw, &orig_len, dst_ip) == 0) {
-                    for (int i = 0; i < m->pending_count; i++) {
-                        if (m->pending[i].family == family &&
-                            memcmp(m->pending[i].ip, dst_ip, ip_len) == 0) {
-                            ct_delete_entry(m->del_fd, family, orig_raw, orig_len);
-                            m->deleted++;
-                            break;
-                        }
-                    }
+                                          &orig_raw, &orig_len, dst_ip) == 0 &&
+                    (m->dump_heal ? m->heal_match(family, dst_ip)
+                                  : ct_pending_match(m, family, dst_ip))) {
+                    ct_delete_entry(m->del_fd, family, orig_raw, orig_len);
+                    m->deleted++;
                 }
             }
             offset += NLMSG_ALIGN(nh->nlmsg_len);
@@ -279,16 +308,13 @@ void conntrack_flush_request(conntrack_mgr_t *m, const parsed_cidr_t *new_ips, i
         m->rescan = 1;
         return;
     }
-    ct_dump_start(m, ct_pending_has_family(m, AF_INET) ? AF_INET : AF_INET6);
+    ct_next_dump(m);
 }
 
-static void ct_put_attr(uint8_t *buf, int *off, uint16_t type,
-                        const void *data, int len) {
-    struct nlattr *a = (struct nlattr *)(buf + *off);
-    a->nla_type = type;
-    a->nla_len = (uint16_t)(NLA_HDRLEN + len);
-    memcpy(buf + *off + NLA_HDRLEN, data, len);
-    *off += NLA_ALIGN(NLA_HDRLEN + len);
+void conntrack_heal_request(conntrack_mgr_t *m) {
+    if (m->fd < 0 || !m->heal_match) return;
+    m->heal_pending = 1;
+    if (m->dump_family == 0) ct_next_dump(m);
 }
 
 static int ct_nest_begin(uint8_t *buf, int *off, uint16_t type) {

@@ -12,6 +12,9 @@
 #define IPSET_HASH_TYPE           "hash:net"
 #define SOCKET_READ_BUFFER        (1024 * 1024)
 #define NF_COMMIT_INTERVAL_MS     3000
+#ifndef CHILD_DEADLINE_MS
+#define CHILD_DEADLINE_MS         10000
+#endif
 #define RCI_TIMEOUT_SEC           10
 #define IPSET_CHUNK_SIZE          256
 #define IPSET_DEFAULT_MAXELEM     262144
@@ -22,6 +25,7 @@
 #define IPSET_CMD_CREATE        2
 #define IPSET_CMD_FLUSH         4
 #define IPSET_CMD_ADD           9
+#define IPSET_CMD_TEST         11
 #define IPSET_CMD_TYPE         13
 #define IPSET_ATTR_PROTOCOL     1
 #define IPSET_ATTR_SETNAME      2
@@ -55,6 +59,8 @@
 #define CTA_PROTO_NUM      1
 #define CTA_PROTO_SRC_PORT 2
 #define CTA_PROTO_DST_PORT 3
+#define CTA_MARK           8
+#define CTA_MARK_MASK     21
 
 #define MAX_GEO_FILES       16
 #define MAX_POLICY_ORDER    64

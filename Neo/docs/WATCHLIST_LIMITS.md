@@ -1,6 +1,6 @@
 # Предельные размеры watchlist в hrneo
 
-**Версия кода:** hrneo 3.21.0-1
+**Версия кода:** hrneo 3.24.0-1
 **Источник:** статический анализ `src/*.c`, `include/*.h`
 
 ---
@@ -67,8 +67,8 @@
 | `RCI_RAW_MAX` | 32 КБ | Статический приёмный буфер `rci_request_ex` (`src/rci.c`); ответ точечного GET — десятки байт |
 | `RCI_TIMEOUT_SEC` | 10 | `SO_RCVTIMEO` / `SO_SNDTIMEO` |
 | `NF_COMMIT_INTERVAL_MS` | 3000 | Пауза между попытками коммита netfilter; SIGUSR1 в этом окне игнорируются |
-| `IPT_DUMP_SIZE` | 65536 | Буфер дампа `iptables -t mangle -S <chain>` (PREROUTING + FORWARD/OUTPUT при L7) на семью |
-| `IPT_BATCH_SIZE` | 65536 | Буфер batch для `iptables-restore` на семью; при перестройке в нём и `-D`, и `-A` всех целей |
+| `IPT_DUMP_SIZE` | 65536 | Буфер дампа `iptables -t mangle -S <chain>` (PREROUTING + HRNEO_CONNMARK + FORWARD/OUTPUT при L7) на семью |
+| `IPT_BATCH_SIZE` | 65536 | Буфер batch для `iptables-restore` на семью; при перестройке в нём `:HRNEO_CONNMARK` и пары всех целей, при `GlobalRouting=true` ещё `:HRNEO_OVERRIDE` с телом и переход на каждую цель. Худший случай — 128 целей с 31-символьными именами ipset: ~54 КБ с `GlobalRouting=true` (422 байта на цель), ~38 КБ без него |
 | `IPT_MAX_RULE_ARGS` | 64 | Максимум argv-токенов при удалении правила |
 
 ### 1.7 Watchlist API (`src/watchlist_api.c`)
@@ -202,7 +202,7 @@ disabled-блок `#/Too-big-geoip-tag`:
 При `l7CaptureEnabled=true`:
 
 - Одновременно буферизуемых TCP-соединений (фрагментированных ClientHello): **`l7TcpReasmMaxEntries`** (default 256, clamp до `TCP_REASM_MAX_ENTRY=256`)
-- Размер буфера на одно соединение: **16 КБ** (`TCP_REASM_BUF_SIZE`); ClientHello больше 16 КБ не собирается — запись не создаётся (`tcp_reasm_start` возвращает `-1`)
+- Размер буфера на одно соединение: **16 КБ** (`TCP_REASM_BUF_SIZE`); ClientHello больше 16 КБ не собирается — запись не создаётся; до 8 несмежных интервалов на запись (`CRYPTO_ASM_RANGES`), больше — запись уничтожается
 - TTL неполных записей: **`l7TcpReasmTtlSec`** секунд (default 5)
 - Кольцо NFLOG-группы на стороне ядра: **128 КБ** (`NFLOG_NLBUFSIZ`); переполнение → `ENOBUFS` → `LOG_WARN`, копии теряются (мягкая деградация — трафик клиента не страдает), не fatal
 - Окно `connbytes` для `dport 443`: первые **`l7ConnbytesMax`** пакетов после SYN (default 8); для `dport 80` ужимается до `min(N, 4)`

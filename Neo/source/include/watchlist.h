@@ -26,9 +26,9 @@ const ht_target_t *watchlist_match(const domain_hashtable_t *ht,
                                    const char *domain, size_t domain_len,
                                    const char **key);
 
-const char *match_domain_with_cname(const domain_hashtable_t *ht,
-                                    const char *domain,
-                                    const dns_cname_t *cnames, int cname_count,
-                                    const char **matched_domain);
+const ht_target_t *match_domain_with_cname(const domain_hashtable_t *ht,
+                                          const char *domain,
+                                          const dns_cname_t *cnames, int cname_count,
+                                          const char **matched_domain);
 
 #endif

@@ -16,12 +16,15 @@ static inline int is_handshake_hello_clienthello(const uint8_t *data, size_t len
            data[5] <= 0x03;
 }
 
+int tls_record_prefix(const uint8_t *data, size_t len) {
+    return len > 0 && data[0] == 0x16 &&
+           (len < 2 || data[1] == 0x03) &&
+           (len < 3 || data[2] <= 0x03) &&
+           (len < 6 || data[5] == 0x01);
+}
+
 int tls_quick_check(const uint8_t *data, size_t len) {
-    return len >= 11 &&
-           data[0] == 0x16 &&
-           data[1] == 0x03 &&
-           data[2] <= 0x03 &&
-           data[5] == 0x01;
+    return len >= 11 && tls_record_prefix(data, len);
 }
 
 static int tls_find_ext_len_offset_in_handshake(const uint8_t *data, size_t len, size_t *off) {
@@ -74,26 +77,26 @@ static int tls_advance_to_host_in_sni(const uint8_t **ext, size_t *elen, size_t 
     return 1;
 }
 
-int tls_extract_sni(const uint8_t *data, size_t len, char *host, size_t host_size) {
-    if (!tls_quick_check(data, len)) return 0;
-    if (!is_handshake_hello_clienthello(data + 5, len - 5)) return 0;
-
-    size_t reclen = (size_t)pntoh16(data + 3) + 5;
-    if (reclen < len) len = reclen;
-
-    const uint8_t *ext;
-    size_t elen;
-    if (!tls_find_ext_in_handshake(data + 5, len - 5, 0, &ext, &elen)) return 0;
-
-    size_t slen;
-    if (!tls_advance_to_host_in_sni(&ext, &elen, &slen)) return 0;
-
-    if (!host || host_size == 0) return 1;
-    if (slen >= host_size) slen = host_size - 1;
-    for (size_t i = 0; i < slen; i++) {
-        uint8_t c = ext[i];
-        host[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : (char)c;
+int host_copy(const uint8_t *s, size_t n, char *out, size_t out_size) {
+    if (n && s[n - 1] == '.') n--;
+    if (n == 0 || n > 253 || n >= out_size) return 0;
+    for (size_t i = 0; i < n; i++) {
+        uint8_t c = s[i];
+        if (c >= 'A' && c <= 'Z') c |= 0x20;
+        else if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                   c == '-' || c == '.' || c == '_'))
+            return 0;
+        out[i] = (char)c;
     }
-    host[slen] = '\0';
+    out[n] = '\0';
     return 1;
+}
+
+int tls_handshake_sni(const uint8_t *hs, size_t len, char *host, size_t host_size) {
+    const uint8_t *ext;
+    size_t elen, slen;
+    if (!is_handshake_hello_clienthello(hs, len)) return 0;
+    if (!tls_find_ext_in_handshake(hs, len, 0, &ext, &elen)) return 0;
+    if (!tls_advance_to_host_in_sni(&ext, &elen, &slen)) return 0;
+    return host_copy(ext, slen, host, host_size);
 }

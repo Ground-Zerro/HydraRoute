@@ -1,12 +1,10 @@
 #include "../include/probe_quic.h"
-#include "../include/probe_tls.h"
 #include "../include/quic_crypto.h"
 #include <string.h>
 #include <stdint.h>
 
 #define QUIC_V1 0x00000001u
 #define QUIC_V2 0x6b3343cfu
-#define QUIC_CH_REC_MAX 8192
 
 static const uint8_t SALT_V1[20] = {
     0x38,0x76,0x2c,0xf7,0xf5,0x59,0x34,0xb3,0x4d,0x17,
@@ -29,19 +27,7 @@ static int read_varint(const uint8_t *buf, size_t len, size_t *pos, uint64_t *va
     return 1;
 }
 
-int quic_ch_to_sni(const uint8_t *ch, size_t ch_len, char *host, size_t host_size) {
-    if (ch_len < 6 || ch_len + 5 > QUIC_CH_REC_MAX) return 0;
-    static uint8_t rec[QUIC_CH_REC_MAX];
-    rec[0] = 0x16; rec[1] = 0x03; rec[2] = 0x01;
-    rec[3] = (uint8_t)(ch_len >> 8);
-    rec[4] = (uint8_t)(ch_len);
-    memcpy(rec + 5, ch, ch_len);
-    return tls_extract_sni(rec, ch_len + 5, host, host_size);
-}
-
-int quic_extract_sni(const uint8_t *pkt, int pkt_len, char *host, size_t host_size,
-                     quic_crypto_frag_t *frag) {
-    if (frag) frag->found = 0;
+int quic_walk_initial(const uint8_t *pkt, int pkt_len, crypto_asm_t *a) {
     if (pkt_len < 20) return 0;
     if ((pkt[0] & 0xC0) != 0xC0) return 0;
 
@@ -49,12 +35,15 @@ int quic_extract_sni(const uint8_t *pkt, int pkt_len, char *host, size_t host_si
                        ((uint32_t)pkt[3] <<  8) |  (uint32_t)pkt[4];
 
     const uint8_t *salt;
+    const char *l_key, *l_iv, *l_hp;
     if (version == QUIC_V1) {
         if ((pkt[0] & 0x30) != 0x00) return 0;
         salt = SALT_V1;
+        l_key = "quic key"; l_iv = "quic iv"; l_hp = "quic hp";
     } else if (version == QUIC_V2) {
         if ((pkt[0] & 0x30) != 0x10) return 0;
         salt = SALT_V2;
+        l_key = "quicv2 key"; l_iv = "quicv2 iv"; l_hp = "quicv2 hp";
     } else {
         return 0;
     }
@@ -74,12 +63,12 @@ int quic_extract_sni(const uint8_t *pkt, int pkt_len, char *host, size_t host_si
 
     uint64_t token_len;
     if (!read_varint(pkt, (size_t)pkt_len, &pos, &token_len)) return 0;
-    if (pos + (size_t)token_len > (size_t)pkt_len) return 0;
+    if (token_len > (uint64_t)((size_t)pkt_len - pos)) return 0;
     pos += (size_t)token_len;
 
     uint64_t payload_len;
     if (!read_varint(pkt, (size_t)pkt_len, &pos, &payload_len)) return 0;
-    if (payload_len < 20 || pos + (size_t)payload_len > (size_t)pkt_len) return 0;
+    if (payload_len < 20 || payload_len > (uint64_t)((size_t)pkt_len - pos)) return 0;
 
     size_t pn_offset = pos;
 
@@ -88,9 +77,9 @@ int quic_extract_sni(const uint8_t *pkt, int pkt_len, char *host, size_t host_si
 
     hkdf_extract(salt, 20, dcid, dcil, initial_secret);
     hkdf_expand_label(initial_secret, "client in", client_secret, 32);
-    hkdf_expand_label(client_secret, "quic key", key, 16);
-    hkdf_expand_label(client_secret, "quic iv",  iv,  12);
-    hkdf_expand_label(client_secret, "quic hp",  hp,  16);
+    hkdf_expand_label(client_secret, l_key, key, 16);
+    hkdf_expand_label(client_secret, l_iv,  iv,  12);
+    hkdf_expand_label(client_secret, l_hp,  hp,  16);
 
     const uint8_t *sample = pkt + pn_offset + 4;
     uint8_t mask[16];
@@ -128,12 +117,7 @@ int quic_extract_sni(const uint8_t *pkt, int pkt_len, char *host, size_t host_si
         uint64_t ftype;
         if (!read_varint(plain, plain_len, &fpos, &ftype)) break;
 
-        if (ftype == 0x00) {
-            continue;
-        }
-        if (ftype == 0x01) {
-            continue;
-        }
+        if (ftype <= 0x01) continue;
         if (ftype == 0x02 || ftype == 0x03) {
             uint64_t v, range_count;
             if (!read_varint(plain, plain_len, &fpos, &v)) break;
@@ -154,19 +138,9 @@ int quic_extract_sni(const uint8_t *pkt, int pkt_len, char *host, size_t host_si
             uint64_t offset, length;
             if (!read_varint(plain, plain_len, &fpos, &offset)) break;
             if (!read_varint(plain, plain_len, &fpos, &length)) break;
-            if (fpos + (size_t)length > plain_len) break;
+            if (length > (uint64_t)(plain_len - fpos)) break;
 
-            if (frag && !frag->found) {
-                frag->found  = 1;
-                frag->offset = offset;
-                frag->data   = plain + fpos;
-                frag->len    = (size_t)length;
-            }
-
-            if (offset == 0 &&
-                quic_ch_to_sni(plain + fpos, (size_t)length, host, host_size))
-                return 1;
-
+            asm_put(a, offset, plain + fpos, (size_t)length);
             fpos += (size_t)length;
             continue;
         }
@@ -174,5 +148,5 @@ int quic_extract_sni(const uint8_t *pkt, int pkt_len, char *host, size_t host_si
     }
 
 done:
-    return 0;
+    return 1;
 }

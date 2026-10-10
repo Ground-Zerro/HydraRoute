@@ -7,11 +7,10 @@
 struct tcp_reasm_entry {
     uint8_t                  in_use;
     tcp_reasm_key_t          key;
-    size_t                   buf_len;
-    size_t                   record_len;
-    uint32_t                 expected_seq;
+    uint32_t                 base_seq;
     int64_t                  ts_added;
     struct tcp_reasm_entry  *next;
+    crypto_asm_t             a;
     uint8_t                  buf[TCP_REASM_BUF_SIZE];
 };
 
@@ -57,7 +56,6 @@ static void entry_release(tcp_reasm_entry_t **link) {
     *link = e->next;
     e->in_use = 0;
     e->next = NULL;
-    e->buf_len = 0;
 }
 
 static tcp_reasm_entry_t *evict_lru(tcp_reasm_t *r) {
@@ -99,81 +97,35 @@ void tcp_reasm_close(tcp_reasm_t *r) {
     memset(r, 0, sizeof(*r));
 }
 
-int tcp_reasm_start(tcp_reasm_t *r, const tcp_reasm_key_t *k,
-                    const uint8_t *payload, size_t len,
-                    size_t record_len, uint32_t seq) {
-    if (!r->pool) return -1;
-    if (record_len > TCP_REASM_BUF_SIZE) return -1;
-    if (len == 0 || len > TCP_REASM_BUF_SIZE) return -1;
+crypto_asm_t *tcp_reasm_find(tcp_reasm_t *r, const tcp_reasm_key_t *k, uint32_t *base_seq) {
+    if (!r->pool) return NULL;
+    tcp_reasm_entry_t *e = bucket_find(r, k, NULL, NULL);
+    if (!e) return NULL;
+    *base_seq = e->base_seq;
+    return &e->a;
+}
 
+crypto_asm_t *tcp_reasm_acquire(tcp_reasm_t *r, const tcp_reasm_key_t *k, uint32_t base_seq) {
+    if (!r->pool) return NULL;
     int bucket;
-    tcp_reasm_entry_t **prev_link;
-    tcp_reasm_entry_t *existing = bucket_find(r, k, &prev_link, &bucket);
-    if (existing) entry_release(prev_link);
+    tcp_reasm_entry_t *e = bucket_find(r, k, NULL, &bucket);
+    if (e) return &e->a;
 
-    tcp_reasm_entry_t *e = pool_alloc(r);
+    e = pool_alloc(r);
     if (!e) {
         e = evict_lru(r);
-        if (!e) return -1;
+        if (!e) return NULL;
     }
-
     e->in_use = 1;
     e->key = *k;
-    e->record_len = record_len;
-    e->buf_len = len;
-    e->expected_seq = seq + (uint32_t)len;
+    e->base_seq = base_seq;
     e->ts_added = now_ns();
-    memcpy(e->buf, payload, len);
-
+    e->a.buf = e->buf;
+    e->a.cap = TCP_REASM_BUF_SIZE;
+    asm_reset(&e->a);
     e->next = r->buckets[bucket];
     r->buckets[bucket] = e;
-    return 0;
-}
-
-int tcp_reasm_lookup(tcp_reasm_t *r, const tcp_reasm_key_t *k) {
-    if (!r->pool) return 0;
-    return bucket_find(r, k, NULL, NULL) != NULL;
-}
-
-int tcp_reasm_feed(tcp_reasm_t *r, const tcp_reasm_key_t *k,
-                   const uint8_t *payload, size_t len, uint32_t seq) {
-    if (!r->pool) return -1;
-    tcp_reasm_entry_t **link = NULL;
-    int bucket;
-    tcp_reasm_entry_t *e = bucket_find(r, k, &link, &bucket);
-    if (!e) return -1;
-
-    int32_t diff = (int32_t)(seq - e->expected_seq);
-    if (diff < 0) return 0;
-    if (diff > 0) {
-        entry_release(link);
-        return 0;
-    }
-    if (e->buf_len + len > TCP_REASM_BUF_SIZE) {
-        entry_release(link);
-        return 0;
-    }
-    memcpy(e->buf + e->buf_len, payload, len);
-    e->buf_len += len;
-    e->expected_seq = seq + (uint32_t)len;
-    return 1;
-}
-
-int tcp_reasm_complete(tcp_reasm_t *r, const tcp_reasm_key_t *k) {
-    if (!r->pool) return 0;
-    tcp_reasm_entry_t *e = bucket_find(r, k, NULL, NULL);
-    if (!e) return 0;
-    return e->buf_len >= e->record_len;
-}
-
-int tcp_reasm_get(tcp_reasm_t *r, const tcp_reasm_key_t *k,
-                  const uint8_t **out, size_t *out_len) {
-    if (!r->pool) return -1;
-    tcp_reasm_entry_t *e = bucket_find(r, k, NULL, NULL);
-    if (!e) return -1;
-    *out = e->buf;
-    *out_len = e->buf_len;
-    return 0;
+    return &e->a;
 }
 
 void tcp_reasm_destroy(tcp_reasm_t *r, const tcp_reasm_key_t *k) {

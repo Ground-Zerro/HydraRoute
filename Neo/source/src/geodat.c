@@ -62,24 +62,19 @@ static int pb_next_field(const uint8_t *data, int len, int *pos, pb_field_t *out
     out->field = tag >> 3;
     out->wire_type = tag & 0x07;
 
+    uint64_t v;
+    int br = read_varint(data, len, *pos, &v);
+    if (br < 0 || (out->wire_type != 0 && out->wire_type != 2)) return -1;
+    *pos += br;
     if (out->wire_type == 0) {
-        int br = read_varint(data, len, *pos, &out->varint);
-        if (br < 0) return -1;
-        *pos += br;
+        out->varint = v;
         return 1;
     }
-    if (out->wire_type == 2) {
-        uint64_t flen;
-        int br = read_varint(data, len, *pos, &flen);
-        if (br < 0) return -1;
-        *pos += br;
-        if (*pos + (int)flen > len) return -1;
-        out->body = data + *pos;
-        out->body_len = (int)flen;
-        *pos += (int)flen;
-        return 1;
-    }
-    return -1;
+    if (v > (uint64_t)(len - *pos)) return -1;
+    out->body = data + *pos;
+    out->body_len = (int)v;
+    *pos += (int)v;
+    return 1;
 }
 
 static int parse_cidr_body(const uint8_t *data, int len, geoip_entry_t *entry) {
@@ -198,44 +193,50 @@ static void extract_geoip_country(const char *entry, char *out, size_t out_size)
 
 typedef void (*dat_body_visitor_t)(const uint8_t *body, int body_len, void *ctx);
 
+#define DAT_ENTRY_MAX (64u << 20)
+
+static int tag_equals_upper(const uint8_t *s, size_t n, const char *upper) {
+    for (size_t i = 0; i < n; i++) {
+        uint8_t c = s[i];
+        if (c >= 'a' && c <= 'z') c -= 32;
+        if (!upper[i] || upper[i] != (char)c) return 0;
+    }
+    return upper[n] == '\0';
+}
+
 static int scan_dat_file(const char *file_path, const char *target_upper,
                           dat_body_visitor_t visit, void *ctx) {
     FILE *f = fopen(file_path, "rb");
     if (!f) return -1;
     setvbuf(f, NULL, _IOFBF, 64 * 1024);
 
-    while (1) {
-        int top_tag = fgetc(f);
-        if (top_tag == EOF) break;
-        if (top_tag != 0x0A) break;
-
-        uint64_t body_len;
-        if (read_varint_stream(f, &body_len) < 0) break;
-
-        uint8_t *body = malloc(body_len);
-        if (!body) break;
-        if (fread(body, 1, body_len, f) != body_len) { free(body); break; }
-
-        if (body_len < 2 || body[0] != 0x0A) { free(body); continue; }
-
-        uint64_t code_len;
-        int br = read_varint(body, (int)body_len, 1, &code_len);
-        if (br < 0) { free(body); continue; }
-        int code_start = 1 + br;
-        if (code_start + (int)code_len > (int)body_len) { free(body); continue; }
-
-        char code[64] = {0};
-        size_t clen = code_len < sizeof(code) - 1 ? code_len : sizeof(code) - 1;
-        memcpy(code, body + code_start, clen);
-        upcase_inplace(code);
-
-        if (strcmp(code, target_upper) == 0) {
-            int data_pos = code_start + (int)code_len;
-            visit(body + data_pos, (int)body_len - data_pos, ctx);
+    uint8_t *body = NULL;
+    size_t cap = 0;
+    uint64_t body_len;
+    while (fgetc(f) == 0x0A && read_varint_stream(f, &body_len) > 0 && body_len <= DAT_ENTRY_MAX) {
+        uint8_t head[1 + 10 + MAX_TAG_LEN];
+        size_t hl = body_len < sizeof(head) ? (size_t)body_len : sizeof(head);
+        if (fread(head, 1, hl, f) != hl) break;
+        uint64_t code_len = 0;
+        int br = hl > 1 && head[0] == 0x0A ? read_varint(head, (int)hl, 1, &code_len) : -1;
+        int match = br > 0 && code_len <= hl - 1 - (size_t)br &&
+                    tag_equals_upper(head + 1 + br, (size_t)code_len, target_upper);
+        if (!match) {
+            if (fseeko(f, (off_t)(body_len - hl), SEEK_CUR) != 0) break;
+            continue;
         }
-        free(body);
+        if (body_len > cap) {
+            uint8_t *nb = realloc(body, (size_t)body_len);
+            if (!nb) break;
+            body = nb;
+            cap = (size_t)body_len;
+        }
+        memcpy(body, head, hl);
+        if (fread(body + hl, 1, (size_t)body_len - hl, f) != (size_t)body_len - hl) break;
+        size_t data_pos = 1 + (size_t)br + (size_t)code_len;
+        visit(body + data_pos, (int)(body_len - data_pos), ctx);
     }
-
+    free(body);
     fclose(f);
     return 0;
 }
@@ -1172,11 +1173,9 @@ int add_cidr_to_ipsets(ipset_manager_t *mgr, const char *cidr_path,
             continue;
         }
         LOG_INFO("Adding %d entries to ipset %s", batches[i].count, batches[i].set_name);
-        int new_count = 0;
-        int new_indices[1];
         ipset_add_batch(mgr, batches[i].set_name,
                         batches[i].entries, batches[i].count,
-                        0, &new_count, new_indices);
+                        IPSET_PERMANENT, NULL, NULL);
         free(batches[i].entries);
     }
 

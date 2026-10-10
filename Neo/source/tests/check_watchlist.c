@@ -31,7 +31,7 @@ static void expect_cname(const char (*order)[64], int order_count,
     domain_hashtable_t *ht = load("example.com", "Airnet", "cloudflare.net", "CF",
                                   order, order_count);
     const char *matched = NULL;
-    assert(strcmp(match_domain_with_cname(ht, A_OWNER, CHAIN, 2, &matched), target) == 0);
+    assert(strcmp(match_domain_with_cname(ht, A_OWNER, CHAIN, 2, &matched)->name, target) == 0);
     assert(strcmp(matched, via) == 0);
     ht_destroy(ht);
 }
@@ -39,7 +39,7 @@ static void expect_cname(const char (*order)[64], int order_count,
 static void expect_subdomain(const char (*order)[64], int order_count, const char *target) {
     domain_hashtable_t *ht = load("google.com", "CN", "mail.google.com", "RU",
                                   order, order_count);
-    assert(strcmp(match_domain_with_cname(ht, "mail.google.com", NULL, 0, NULL), target) == 0);
+    assert(strcmp(match_domain_with_cname(ht, "mail.google.com", NULL, 0, NULL)->name, target) == 0);
     ht_destroy(ht);
 }
 

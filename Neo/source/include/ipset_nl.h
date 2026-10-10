@@ -5,6 +5,8 @@
 #include <netinet/in.h>
 
 #define IPSET_MAX_SETS 512
+#define IPSET_PERMANENT (-1)
+#define IPSET_OWNED_SLOTS 4096
 
 typedef struct {
     int fd;
@@ -23,7 +25,9 @@ int ipset_flush(ipset_manager_t *mgr, const char *name);
 
 int ipset_add_batch(ipset_manager_t *mgr, const char *set_name,
                     const parsed_cidr_t *entries, int count,
-                    int with_timeout, int *new_count, int *new_indices);
+                    int owner, int *new_count, int *new_indices);
+
+int ipset_test(ipset_manager_t *mgr, const char *set_name, const parsed_cidr_t *entry);
 
 int ipset_refresh_set_list(ipset_manager_t *mgr);
 int ipset_set_exists(ipset_manager_t *mgr, const char *name);

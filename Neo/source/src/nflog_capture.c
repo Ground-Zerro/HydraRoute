@@ -20,6 +20,8 @@
 #define NFULA_CFG_CMD          1
 #define NFULA_CFG_MODE         2
 #define NFULA_CFG_NLBUFSIZ     3
+#define NFULA_CFG_TIMEOUT      4
+#define NFULA_CFG_QTHRESH      5
 
 #define NFULNL_COPY_PACKET     2
 
@@ -115,20 +117,24 @@ static int nflog_cfg_cmd(nflog_capture_t *cap, uint16_t group,
     return nflog_send_config(cap, group, family, attrs, len);
 }
 
-static int nflog_cfg_mode(nflog_capture_t *cap, uint16_t group,
-                          uint32_t copy_range, uint32_t nlbufsiz) {
+static int nla_put_be32(uint8_t *buf, uint16_t type, uint32_t val) {
+    uint8_t be[4];
+    put_be32(be, val);
+    return nla_put(buf, type, be, 4);
+}
+
+static int nflog_cfg_mode(nflog_capture_t *cap, uint16_t group) {
     uint8_t attrs[64];
     int len = 0;
 
     struct nful_msg_config_mode mode;
     memset(&mode, 0, sizeof(mode));
-    put_be32((uint8_t *)&mode.copy_range, copy_range);
+    put_be32((uint8_t *)&mode.copy_range, NFLOG_COPY_RANGE);
     mode.copy_mode = NFULNL_COPY_PACKET;
     len += nla_put(attrs + len, NFULA_CFG_MODE, &mode, sizeof(mode));
-
-    uint8_t be_buf[4];
-    put_be32(be_buf, nlbufsiz);
-    len += nla_put(attrs + len, NFULA_CFG_NLBUFSIZ, be_buf, 4);
+    len += nla_put_be32(attrs + len, NFULA_CFG_NLBUFSIZ, NFLOG_NLBUFSIZ);
+    len += nla_put_be32(attrs + len, NFULA_CFG_TIMEOUT, NFLOG_FLUSH_CS);
+    len += nla_put_be32(attrs + len, NFULA_CFG_QTHRESH, NFLOG_QTHRESH);
 
     return nflog_send_config(cap, group, 0, attrs, len);
 }
@@ -229,7 +235,7 @@ int nflog_capture_init(nflog_capture_t *cap, uint16_t group,
         return -1;
     }
 
-    if (nflog_cfg_mode(cap, group, NFLOG_COPY_RANGE, NFLOG_NLBUFSIZ) != 0) {
+    if (nflog_cfg_mode(cap, group) != 0) {
         LOG_ERROR("nflog set mode group %u failed", group);
         close(cap->fd);
         cap->fd = -1;

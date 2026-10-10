@@ -5,7 +5,9 @@
 #include <stddef.h>
 
 #define NFLOG_RECV_BUF_SIZE  (128 * 1024)
-#define NFLOG_NLBUFSIZ       (128 * 1024)
+#define NFLOG_QTHRESH        8
+#define NFLOG_FLUSH_CS       2
+#define NFLOG_NLBUFSIZ       (16 * 1024)
 #define NFLOG_COPY_RANGE     0xFFFF
 
 typedef void (*nflog_packet_cb)(const uint8_t *ip_pkt, int len,

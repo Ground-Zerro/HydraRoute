@@ -5,7 +5,6 @@
 #include "../include/log.h"
 #include <errno.h>
 #include <pthread.h>
-#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -279,11 +278,7 @@ int wlapi_start(const char *path, const domain_hashtable_t *ht) {
         epoll_add_ptr(g_api.stop_fd, &g_api.stop_fd) < 0)
         goto fail;
 
-    sigset_t all, prev;
-    sigfillset(&all);
-    pthread_sigmask(SIG_SETMASK, &all, &prev);
-    int rc = pthread_create(&g_api.thread, NULL, wlapi_loop, NULL);
-    pthread_sigmask(SIG_SETMASK, &prev, NULL);
+    int rc = thread_start_masked(&g_api.thread, wlapi_loop);
     if (rc != 0) {
         errno = rc;
         goto fail;

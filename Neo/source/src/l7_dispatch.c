@@ -45,42 +45,64 @@ static void build_quic_key(tcp_reasm_key_t *k, int family,
     k->family |= 0x80;
 }
 
-static void try_tls_extract(const uint8_t *payload, int payload_len,
-                            uint32_t seq,
-                            const tcp_reasm_key_t *key,
-                            const uint8_t *daddr, int family,
-                            const l7_conn_t *conn) {
-    char host[256];
+typedef int (*stream_parse_fn)(const uint8_t *data, size_t len, char *host, size_t host_size);
 
-    if (g_reasm_ref && tcp_reasm_lookup(g_reasm_ref, key)) {
-        int rc = tcp_reasm_feed(g_reasm_ref, key, payload, (size_t)payload_len, seq);
-        if (rc == 1 && tcp_reasm_complete(g_reasm_ref, key)) {
-            const uint8_t *full; size_t flen;
-            if (tcp_reasm_get(g_reasm_ref, key, &full, &flen) == 0 &&
-                tls_extract_sni(full, flen, host, sizeof(host)) &&
-                !bogon_check(daddr, family))
-            {
-                process_hostname_event_l7(host, L7_TLS, conn);
-            }
-            tcp_reasm_destroy(g_reasm_ref, key);
-        }
-        return;
+static int tls_stream(const uint8_t *data, size_t len, char *host, size_t host_size) {
+    if (len < 11) return tls_record_prefix(data, len) ? 0 : -1;
+    if (!tls_quick_check(data, len)) return -1;
+    size_t reclen = (size_t)((data[3] << 8) | data[4]) + 5;
+    if (reclen > TCP_REASM_BUF_SIZE) return -1;
+    if (len < reclen) return 0;
+    return tls_handshake_sni(data + 5, reclen - 5, host, host_size) ? 1 : -1;
+}
+
+static int http_stream(const uint8_t *data, size_t len, char *host, size_t host_size) {
+    if (!http_request_prefix(data, len)) return -1;
+    if (http_extract_host(data, len, host, host_size)) return 1;
+    return http_headers_end(data, len) || len >= TCP_REASM_BUF_SIZE ? -1 : 0;
+}
+
+static int stream_host(stream_parse_fn parse, const uint8_t *payload, size_t len, uint32_t seq,
+                       const tcp_reasm_key_t *key, char *host, size_t host_size) {
+    uint32_t base;
+    crypto_asm_t *e = g_reasm_ref ? tcp_reasm_find(g_reasm_ref, key, &base) : NULL;
+    if (e && seq - base >= e->cap) {
+        tcp_reasm_destroy(g_reasm_ref, key);
+        e = NULL;
     }
-
-    if (!tls_quick_check(payload, (size_t)payload_len)) return;
-
-    size_t reclen = (size_t)((payload[3] << 8) | payload[4]) + 5;
-    if (reclen <= (size_t)payload_len) {
-        if (tls_extract_sni(payload, (size_t)payload_len, host, sizeof(host)) &&
-            !bogon_check(daddr, family))
-        {
-            process_hostname_event_l7(host, L7_TLS, conn);
-        }
-        return;
+    if (!e) {
+        int r = parse(payload, len, host, host_size);
+        if (r != 0 || !g_reasm_ref) return r > 0;
+        e = tcp_reasm_acquire(g_reasm_ref, key, seq);
+        if (!e) return 0;
+        base = seq;
     }
+    asm_put(e, seq - base, payload, len);
+    int r = e->broken ? -1 : e->r[0].lo ? 0 : parse(e->buf, e->r[0].hi, host, host_size);
+    if (r != 0) tcp_reasm_destroy(g_reasm_ref, key);
+    return r > 0;
+}
 
-    if (g_reasm_ref)
-        tcp_reasm_start(g_reasm_ref, key, payload, (size_t)payload_len, reclen, seq);
+static int quic_sni(const uint8_t *quic, int quic_len, const tcp_reasm_key_t *key,
+                    char *host, size_t host_size) {
+    static uint8_t local[TCP_REASM_BUF_SIZE];
+    crypto_asm_t a = { .buf = local, .cap = sizeof(local) };
+    if (!quic_walk_initial(quic, quic_len, &a) || !a.nranges) return 0;
+    asm_handshake_total(&a);
+    if (asm_complete(&a)) return tls_handshake_sni(local, a.total, host, host_size);
+    if (!g_reasm_ref) return 0;
+
+    crypto_asm_t *e = tcp_reasm_acquire(g_reasm_ref, key, 0);
+    if (!e) return 0;
+    asm_merge(e, &a);
+    asm_handshake_total(e);
+    if (!asm_complete(e)) {
+        if (e->broken) tcp_reasm_destroy(g_reasm_ref, key);
+        return 0;
+    }
+    int ok = tls_handshake_sni(e->buf, e->total, host, host_size);
+    tcp_reasm_destroy(g_reasm_ref, key);
+    return ok;
 }
 
 void l7_dispatch_packet(const uint8_t *pkt, int len,
@@ -127,37 +149,10 @@ void l7_dispatch_packet(const uint8_t *pkt, int len,
         int quic_len = len - ip_hlen - 8;
         if (quic_len < 20) return;
 
+        tcp_reasm_key_t key;
+        build_quic_key(&key, dst_family, saddr, daddr, sport, dport);
         char host[256];
-        quic_crypto_frag_t frag = { 0 };
-        if (quic_extract_sni(quic, quic_len, host, sizeof(host), &frag) != 1) {
-            if (!frag.found || !g_reasm_ref) return;
-
-            tcp_reasm_key_t key;
-            build_quic_key(&key, dst_family, saddr, daddr, sport, dport);
-
-            if (frag.offset == 0) {
-                if (frag.len < 4) return;
-                size_t total = 4 + ((size_t)frag.data[1] << 16 |
-                                    (size_t)frag.data[2] << 8  |
-                                    (size_t)frag.data[3]);
-                if (tcp_reasm_start(g_reasm_ref, &key, frag.data, frag.len,
-                                    total, 0) != 0)
-                    return;
-            } else {
-                if (!tcp_reasm_lookup(g_reasm_ref, &key)) return;
-                if (tcp_reasm_feed(g_reasm_ref, &key, frag.data, frag.len,
-                                   (uint32_t)frag.offset) != 1)
-                    return;
-            }
-
-            if (!tcp_reasm_complete(g_reasm_ref, &key)) return;
-
-            const uint8_t *full; size_t flen;
-            int ok = tcp_reasm_get(g_reasm_ref, &key, &full, &flen) == 0 &&
-                     quic_ch_to_sni(full, flen, host, sizeof(host));
-            tcp_reasm_destroy(g_reasm_ref, &key);
-            if (!ok) return;
-        }
+        if (!quic_sni(quic, quic_len, &key, host, sizeof(host))) return;
         if (bogon_check(daddr, dst_family)) return;
 
         l7_conn_t conn;
@@ -211,21 +206,22 @@ void l7_dispatch_packet(const uint8_t *pkt, int len,
         memcpy(conn.server_ip, daddr, 16);
     }
 
-    if (dport == 443) {
-        if (!l7_tls_enabled) return;
-        tcp_reasm_key_t key;
-        build_key(&key, dst_family, saddr, daddr, sport, dport);
-        try_tls_extract(payload, payload_len, seq, &key, daddr, dst_family, &conn);
+    int proto;
+    stream_parse_fn parse;
+    if (dport == 443 && l7_tls_enabled) {
+        proto = L7_TLS;
+        parse = tls_stream;
+    } else if (dport == 80 && l7_http_enabled) {
+        proto = L7_HTTP;
+        parse = http_stream;
+    } else {
         return;
     }
 
-    if (dport == 80) {
-        if (!l7_http_enabled) return;
-        if (!http_quick_check(payload, (size_t)payload_len)) return;
-        char host[256];
-        if (!http_extract_host(payload, (size_t)payload_len, host, sizeof(host)))
-            return;
-        if (bogon_check(daddr, dst_family)) return;
-        process_hostname_event_l7(host, L7_HTTP, &conn);
-    }
+    tcp_reasm_key_t key;
+    build_key(&key, dst_family, saddr, daddr, sport, dport);
+    char host[256];
+    if (stream_host(parse, payload, (size_t)payload_len, seq, &key, host, sizeof(host)) &&
+        !bogon_check(daddr, dst_family))
+        process_hostname_event_l7(host, proto, &conn);
 }

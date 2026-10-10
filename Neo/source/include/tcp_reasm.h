@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "crypto_asm.h"
 
 #define TCP_REASM_BUCKETS    64
 #define TCP_REASM_MAX_ENTRY  256
@@ -29,19 +30,8 @@ typedef struct tcp_reasm {
 int  tcp_reasm_init   (tcp_reasm_t *r, int max_entries, int ttl_sec);
 void tcp_reasm_close  (tcp_reasm_t *r);
 
-int  tcp_reasm_start  (tcp_reasm_t *r, const tcp_reasm_key_t *k,
-                       const uint8_t *payload, size_t len,
-                       size_t record_len, uint32_t seq);
-
-int  tcp_reasm_lookup (tcp_reasm_t *r, const tcp_reasm_key_t *k);
-
-int  tcp_reasm_feed   (tcp_reasm_t *r, const tcp_reasm_key_t *k,
-                       const uint8_t *payload, size_t len, uint32_t seq);
-
-int  tcp_reasm_complete(tcp_reasm_t *r, const tcp_reasm_key_t *k);
-
-int  tcp_reasm_get    (tcp_reasm_t *r, const tcp_reasm_key_t *k,
-                       const uint8_t **out, size_t *out_len);
+crypto_asm_t *tcp_reasm_find   (tcp_reasm_t *r, const tcp_reasm_key_t *k, uint32_t *base_seq);
+crypto_asm_t *tcp_reasm_acquire(tcp_reasm_t *r, const tcp_reasm_key_t *k, uint32_t base_seq);
 
 void tcp_reasm_destroy(tcp_reasm_t *r, const tcp_reasm_key_t *k);
 

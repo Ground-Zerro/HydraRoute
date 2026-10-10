@@ -6,9 +6,13 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <errno.h>
+#include <time.h>
 #include <sys/socket.h>
 #include <linux/netlink.h>
 #include <linux/netfilter/nfnetlink.h>
+
+#define IPSET_ADT_MSG_MAX 160
+#define IPSET_REPLY_MAX   512
 
 static void ipset_add_to_cache(ipset_manager_t *mgr, const char *name);
 
@@ -44,27 +48,45 @@ static int nla_put_raw(uint8_t *buf, uint16_t type, const uint8_t *data, int dat
     return NLA_ALIGN(nla_len);
 }
 
-static int nl_send_recv_ack(ipset_manager_t *mgr, uint8_t *buf, int len) {
+static int nl_exchange(ipset_manager_t *mgr, const uint8_t *buf, int len, int n, int *errs, uint8_t *reply) {
+    uint32_t seq0 = ((const struct nlmsghdr *)buf)->nlmsg_seq;
+    for (int i = 0; i < n; i++) errs[i] = 0;
     if (send(mgr->fd, buf, len, 0) < 0) {
         LOG_ERROR("netlink send: %s", strerror(errno));
         return -1;
     }
 
-    uint8_t resp[512];
-    int n = recv(mgr->fd, resp, sizeof(resp), 0);
-    if (n < 0) {
-        LOG_ERROR("netlink recv: %s", strerror(errno));
-        return -1;
-    }
-
-    struct nlmsghdr *nh = (struct nlmsghdr *)resp;
-    if (nh->nlmsg_type == NLMSG_ERROR) {
-        struct nlmsgerr *err = (struct nlmsgerr *)((uint8_t *)nh + NLMSG_HDRLEN);
-        if (err->error != 0) {
-            return -err->error;
+    uint8_t resp[IPSET_REPLY_MAX];
+    int reply_len = 0, lost = 0;
+    for (;;) {
+        ssize_t r = recv(mgr->fd, resp, sizeof(resp), MSG_DONTWAIT);
+        if (r < 0) {
+            if (errno != ENOBUFS) break;
+            lost = 1;
+            continue;
+        }
+        const struct nlmsghdr *nh = (const struct nlmsghdr *)resp;
+        uint32_t k = nh->nlmsg_seq - seq0;
+        if (r < (ssize_t)(NLMSG_HDRLEN + sizeof(struct nlmsgerr)) || k >= (uint32_t)n) continue;
+        if (nh->nlmsg_type == NLMSG_ERROR) {
+            errs[k] = -((const struct nlmsgerr *)NLMSG_DATA(nh))->error;
+        } else if (reply) {
+            memcpy(reply, resp, (size_t)r);
+            reply_len = (int)r;
         }
     }
-    return 0;
+
+    if (lost) {
+        LOG_WARN("netlink: ipset replies lost (ENOBUFS)");
+        for (int i = 0; i < n; i++)
+            if (errs[i] == 0) errs[i] = -1;
+    }
+    return reply_len;
+}
+
+static int nl_request(ipset_manager_t *mgr, const uint8_t *buf, int len) {
+    int err;
+    return nl_exchange(mgr, buf, len, 1, &err, NULL) < 0 ? -1 : err;
 }
 
 int ipset_manager_init(ipset_manager_t *mgr) {
@@ -117,16 +139,10 @@ static int ipset_query_revision(ipset_manager_t *mgr, const char *type, int fami
     offset += nla_put_u8(buf + offset, IPSET_ATTR_FAMILY, nf_family);
     nlh->nlmsg_len = offset;
 
-    if (send(mgr->fd, buf, offset, 0) < 0)
-        return 0;
-
-    uint8_t resp[512];
-    int n = recv(mgr->fd, resp, sizeof(resp), 0);
+    uint8_t resp[IPSET_REPLY_MAX];
+    int err;
+    int n = nl_exchange(mgr, buf, offset, 1, &err, resp);
     if (n < (int)(NLMSG_HDRLEN + 4))
-        return 0;
-
-    struct nlmsghdr *rnh = (struct nlmsghdr *)resp;
-    if (rnh->nlmsg_type == NLMSG_ERROR)
         return 0;
 
     uint8_t *attrs = resp + NLMSG_HDRLEN + 4;
@@ -154,7 +170,7 @@ static int build_create_msg(uint8_t *buf, int buf_size, ipset_manager_t *mgr,
 
     struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
     nlh->nlmsg_type = (NFNL_SUBSYS_IPSET << 8) | IPSET_CMD_CREATE;
-    nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL;
+    nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_CREATE | NLM_F_EXCL;
     nlh->nlmsg_seq = mgr->seq++;
     nlh->nlmsg_pid = mgr->pid;
 
@@ -204,7 +220,7 @@ int ipset_create(ipset_manager_t *mgr, const char *name, const char *type, int f
     uint8_t buf[512];
     int msg_len = build_create_msg(buf, sizeof(buf), mgr, name, type, family,
                                    timeout, maxelem, revision);
-    int ret = nl_send_recv_ack(mgr, buf, msg_len);
+    int ret = nl_request(mgr, buf, msg_len);
 
     if (ret == 17) {
         LOG_DEBUG("Set %s already exists", name);
@@ -227,7 +243,7 @@ int ipset_flush(ipset_manager_t *mgr, const char *name) {
 
     struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
     nlh->nlmsg_type = (NFNL_SUBSYS_IPSET << 8) | IPSET_CMD_FLUSH;
-    nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+    nlh->nlmsg_flags = NLM_F_REQUEST;
     nlh->nlmsg_seq = mgr->seq++;
     nlh->nlmsg_pid = mgr->pid;
 
@@ -242,7 +258,7 @@ int ipset_flush(ipset_manager_t *mgr, const char *name) {
 
     LOG_DEBUG("Netlink FLUSH: set=%s", name);
 
-    int ret = nl_send_recv_ack(mgr, buf, offset);
+    int ret = nl_request(mgr, buf, offset);
     if (ret != 0) {
         LOG_DEBUG("Netlink FLUSH error: errno=%d", ret);
         return ret;
@@ -252,16 +268,16 @@ int ipset_flush(ipset_manager_t *mgr, const char *name) {
     return 0;
 }
 
-static int build_ipset_add_msg(uint8_t *buf, int buf_size, ipset_manager_t *mgr,
+static int build_ipset_adt_msg(uint8_t *buf, int buf_size, ipset_manager_t *mgr,
+                               uint8_t cmd, uint16_t flags,
                                const char *set_name_nul, int set_name_len,
                                const parsed_cidr_t *entry,
-                               int has_timeout, const uint8_t *timeout_bytes,
-                               uint16_t extra_flags) {
+                               int has_timeout, const uint8_t *timeout_bytes) {
     memset(buf, 0, buf_size > 256 ? 256 : buf_size);
 
     struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
-    nlh->nlmsg_type = (NFNL_SUBSYS_IPSET << 8) | IPSET_CMD_ADD;
-    nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | extra_flags;
+    nlh->nlmsg_type = (NFNL_SUBSYS_IPSET << 8) | cmd;
+    nlh->nlmsg_flags = NLM_F_REQUEST | flags;
     nlh->nlmsg_seq = mgr->seq++;
     nlh->nlmsg_pid = mgr->pid;
 
@@ -330,85 +346,125 @@ static int is_service_ip(const uint8_t *ip, int family) {
     return (memcmp(ip, zeros, 16) == 0 || memcmp(ip, loopback, 16) == 0);
 }
 
+typedef struct {
+    uint8_t  ip[16];
+    uint32_t refresh_at;
+    int16_t  owner;
+    uint8_t  family;
+} owned_slot_t;
+
+static owned_slot_t g_owned[IPSET_OWNED_SLOTS];
+
+static uint32_t now_sec(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t)ts.tv_sec;
+}
+
+static owned_slot_t *owned_slot(int owner, const parsed_cidr_t *e) {
+    uint32_t h = fnv1a_hash((const char *)e->ip, sizeof(e->ip)) ^ ((uint32_t)owner * 0x9e3779b9u);
+    return &g_owned[h & (IPSET_OWNED_SLOTS - 1)];
+}
+
+static int owned_by(const owned_slot_t *s, int owner, const parsed_cidr_t *e) {
+    return s->family == e->family && s->owner == owner && memcmp(s->ip, e->ip, sizeof(s->ip)) == 0;
+}
+
+static int send_adds(ipset_manager_t *mgr, const char *set_name_nul, int set_name_len,
+                     const parsed_cidr_t *entries, const int *idx, int n,
+                     int has_timeout, const uint8_t *timeout_bytes, uint16_t flags, int *errs) {
+    static uint8_t batch[IPSET_CHUNK_SIZE * IPSET_ADT_MSG_MAX];
+    int len = 0;
+    for (int i = 0; i < n; i++)
+        len += build_ipset_adt_msg(batch + len, (int)sizeof(batch) - len, mgr,
+                                   IPSET_CMD_ADD, NLM_F_CREATE | flags,
+                                   set_name_nul, set_name_len, &entries[idx[i]],
+                                   has_timeout, timeout_bytes);
+    return nl_exchange(mgr, batch, len, n, errs, NULL) < 0 ? -1 : 0;
+}
+
 int ipset_add_batch(ipset_manager_t *mgr, const char *set_name,
                     const parsed_cidr_t *entries, int count,
-                    int with_timeout, int *new_count, int *new_indices) {
+                    int owner, int *new_count, int *new_indices) {
+    if (new_count) *new_count = 0;
     if (count == 0) return 0;
 
     int has_timeout = mgr->default_timeout > 0;
+    int dynamic = owner != IPSET_PERMANENT;
+    int tracked = dynamic && has_timeout;
+    uint32_t now = now_sec();
+    uint32_t refresh_at = now + mgr->default_timeout / 2;
 
     uint8_t timeout_bytes[4] = {0};
-    if (has_timeout && with_timeout) {
-        put_u32_network(timeout_bytes, mgr->default_timeout);
-    }
-
-    uint16_t excl_flag = with_timeout ? NLM_F_EXCL : 0;
+    if (has_timeout && dynamic) put_u32_network(timeout_bytes, mgr->default_timeout);
 
     char set_name_nul[64];
     int set_name_len = snprintf(set_name_nul, sizeof(set_name_nul), "%s", set_name) + 1;
-
-    *new_count = 0;
 
     for (int start = 0; start < count; start += IPSET_CHUNK_SIZE) {
         int end = start + IPSET_CHUNK_SIZE;
         if (end > count) end = count;
 
-        uint8_t msg_bufs[IPSET_CHUNK_SIZE][256];
-        int msg_lens[IPSET_CHUNK_SIZE];
-        int valid_indices[IPSET_CHUNK_SIZE];
-        int msg_count = 0;
-
+        int idx[IPSET_CHUNK_SIZE], errs[IPSET_CHUNK_SIZE], ext[IPSET_CHUNK_SIZE];
+        int n = 0, ne = 0;
         for (int i = start; i < end; i++) {
             if (is_service_ip(entries[i].ip, entries[i].family)) {
                 LOG_FILTERED("Service IP rejected (family=%d)", entries[i].family);
                 continue;
             }
-
-            msg_lens[msg_count] = build_ipset_add_msg(
-                msg_bufs[msg_count], sizeof(msg_bufs[msg_count]),
-                mgr, set_name_nul, set_name_len,
-                &entries[i],
-                has_timeout, timeout_bytes,
-                excl_flag);
-            valid_indices[msg_count] = i;
-            msg_count++;
-        }
-
-        if (msg_count == 0) continue;
-
-        for (int i = 0; i < msg_count; i++) {
-            if (send(mgr->fd, msg_bufs[i], msg_lens[i], 0) < 0) {
-                LOG_ERROR("netlink send batch: %s", strerror(errno));
-                return -1;
+            if (tracked) {
+                const owned_slot_t *slot = owned_slot(owner, &entries[i]);
+                if (owned_by(slot, owner, &entries[i]) && (int32_t)(now - slot->refresh_at) < 0)
+                    continue;
             }
+            idx[n++] = i;
         }
+        if (n == 0) continue;
 
-        for (int i = 0; i < msg_count; i++) {
-            uint8_t resp[256];
-            int n = recv(mgr->fd, resp, sizeof(resp), 0);
-            if (n < 0) continue;
+        if (send_adds(mgr, set_name_nul, set_name_len, entries, idx, n, has_timeout,
+                      timeout_bytes, dynamic ? NLM_F_EXCL : 0, errs) != 0)
+            return -1;
 
-            struct nlmsghdr *nh = (struct nlmsghdr *)resp;
-            if (nh->nlmsg_type == NLMSG_ERROR) {
-                struct nlmsgerr *err = (struct nlmsgerr *)((uint8_t *)nh + NLMSG_HDRLEN);
-                if (err->error == 0) {
-                    if (with_timeout && new_indices) {
-                        new_indices[*new_count] = valid_indices[i];
-                        (*new_count)++;
-                    }
-                } else {
-                    int errcode = -err->error;
-                    if (errcode == IPSET_ERR_HASH_FULL) {
-                        LOG_WARN("ipset '%s' full (maxelem exceeded): set IpsetMaxElem in config", set_name);
-                    } else if (errcode != IPSET_ERR_EXIST) {
-                        LOG_DEBUG("Netlink ADD error: errno=%d", errcode);
-                    }
+        for (int i = 0; i < n; i++) {
+            const parsed_cidr_t *e = &entries[idx[i]];
+            if (errs[i] == 0) {
+                if (dynamic && new_indices) new_indices[(*new_count)++] = idx[i];
+                if (tracked) {
+                    owned_slot_t *slot = owned_slot(owner, e);
+                    memcpy(slot->ip, e->ip, sizeof(slot->ip));
+                    slot->family = e->family;
+                    slot->owner = (int16_t)owner;
+                    slot->refresh_at = refresh_at;
                 }
+            } else if (errs[i] == IPSET_ERR_EXIST) {
+                if (tracked && owned_by(owned_slot(owner, e), owner, e))
+                    ext[ne++] = idx[i];
+            } else if (errs[i] == IPSET_ERR_HASH_FULL) {
+                LOG_WARN("ipset '%s' full (maxelem exceeded): set IpsetMaxElem in config", set_name);
+            } else if (errs[i] > 0) {
+                LOG_DEBUG("Netlink ADD error: errno=%d", errs[i]);
             }
         }
+
+        if (ne == 0) continue;
+        if (send_adds(mgr, set_name_nul, set_name_len, entries, ext, ne, has_timeout,
+                      timeout_bytes, 0, errs) != 0)
+            return -1;
+        for (int i = 0; i < ne; i++)
+            if (errs[i] == 0) owned_slot(owner, &entries[ext[i]])->refresh_at = refresh_at;
+        LOG_DEBUG("ipset %s: timeout extended for %d owned entries", set_name, ne);
     }
 
     return 0;
+}
+
+int ipset_test(ipset_manager_t *mgr, const char *set_name, const parsed_cidr_t *entry) {
+    uint8_t buf[256];
+    char set_name_nul[64];
+    int set_name_len = snprintf(set_name_nul, sizeof(set_name_nul), "%s", set_name) + 1;
+    int len = build_ipset_adt_msg(buf, sizeof(buf), mgr, IPSET_CMD_TEST, 0,
+                                  set_name_nul, set_name_len, entry, 0, NULL);
+    return nl_request(mgr, buf, len) == 0;
 }
 
 int ipset_refresh_set_list(ipset_manager_t *mgr) {

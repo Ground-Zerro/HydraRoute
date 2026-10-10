@@ -1,6 +1,6 @@
 # HRNeo — техническая документация кодовой базы
 
-Исходный код HRNeo (HydraRoute Neo) v3.21.0-1: архитектура, модули, потоки данных, оптимизации.
+Исходный код HRNeo (HydraRoute Neo) v3.24.0-1: архитектура, модули, потоки данных, оптимизации.
 
 ---
 
@@ -11,7 +11,7 @@ HRNeo — демон для policy routing на роутерах Keenetic (Entwa
 ### Два независимых источника имён хостов
 
 - **DNS-канал** (всегда): перехват DNS-ответов (ndnproxy Keenetic или любой другой DNS-сервер на роутере и в туннелях) через AF_PACKET SOCK_DGRAM + L3-BPF. Работает на интерфейсах любого типа — Ethernet, PPP, ARPHRD_NONE (WireGuard, VPN-сервер, IPsec, туннели). Ловит DNS и LAN-, и VPN-клиентов.
-- **L7-канал** (опционально, `l7CaptureEnabled`): перехват TLS SNI / HTTP Host / QUIC Initial SNI исходящих соединений через NFLOG (пассивное копирование пакета, нетерминирующая цель). Фаза 2 — реассамблеция длинных ClientHello: TCP (по seq) и QUIC CRYPTO-фрагментов многодатаграммного Initial (MLKEM/Kyber), обе поверх общего пула `tcp_reasm`. QUIC — CRYPTO-walker с дешифровкой Initial-пакета. Подробно — раздел [18](#18-l7-перехват-tls-sni--http-host--tcp-реассамблеция).
+- **L7-канал** (опционально, `l7CaptureEnabled`): перехват TLS SNI / HTTP Host / QUIC Initial SNI исходящих соединений через NFLOG (пассивное копирование пакета, нетерминирующая цель). Фаза 2 — реассамблеция длинных ClientHello: TCP (по seq) и QUIC CRYPTO-фрагментов многодатаграммного Initial (MLKEM/Kyber), обе поверх общего пула `tcp_reasm`. QUIC — CRYPTO-walker с дешифровкой Initial-пакета; все CRYPTO-фреймы собираются по интервалам (`crypto_asm.h`). Подробно — раздел [18](#18-l7-перехват-tls-sni--http-host--tcp-реассамблеция).
 
 ### Принцип работы (пошагово)
 
@@ -61,9 +61,9 @@ HRNeo — демон для policy routing на роутерах Keenetic (Entwa
 12. **Извлечение `markID` политик через RCI** + создание `CONNMARK`-правил `iptables` (`apply_unified_connmark_rules`, подробно — раздел [8](#8-маршрутизация-и-маркировка)):
     - Точечный `GET /rci/show/ip/policy/<Name>/mark` возвращает голое значение `"ffffaaa"` (~10 байт; HTTP 404 — политики нет). Полное дерево политик со всеми маршрутами не выкачивается, JSON-парсер не нужен — из ответа снимаются кавычки и префикс `0x`. Лог при `log=console/file`: `[DEBUG] RCI policy: HydraRoute mark=0xffffaaa`
     - Запрос идёт для каждой цели-политики только на стартовой сверке (`startup_audit`, до первого успешного коммита): марки в правилах сверяются с RCI, осиротевшие правила исчезнувших политик удаляются. Дальше RCI опрашивается лениво — только для целей, у которых в таблице нет правил
-    - Ретрая внутри RCI-клиента нет: и сетевая ошибка, и «политика создана, но `markID` ещё не назначен» дают `-1` из `apply_unified_connmark_rules`, а повтор обеспечивает коммитер (`commit_run`, фиксированные `NF_COMMIT_INTERVAL_MS` = 3 с, без роста интервала, бесконечно). Один механизм ожидания вместо трёх вложенных, и он не блокирует epoll-цикл
+    - Ретрая внутри RCI-клиента нет: и сетевая ошибка, и «политика создана, но `markID` ещё не назначен» дают `-1` из `apply_unified_connmark_rules`, а повтор обеспечивает коммитер (поток `nf_worker`, фиксированные `NF_COMMIT_INTERVAL_MS` = 3 с, без роста интервала, бесконечно). Один механизм ожидания вместо трёх вложенных, и он работает вне epoll-цикла пакетного пути (раздел 9)
     - Для целей-интерфейсов `markID` не запрашивается — используется назначенный `fwmark`
-    - Для каждой цели в порядке `g_all_sorted[]` формируется пара `CONNMARK`-правил в `mangle/PREROUTING`, через `iptables-restore --noflush` (один вызов на весь батч). Если марку получить не удалось (RCI недоступен, авторизация отклонена, политики нет или `markID` ещё не назначен) — `LOG_WARN`, цель пропускается в этом батче и выставляется `incomplete=1`: остальные цели применяются, но функция возвращает `-1` (`ipset` продолжит заполняться, но трафик этой цели не маркируется до следующего коммита)
+    - Для каждой цели в порядке `g_all_sorted[]` формируется пара `CONNMARK`-правил в цепочке `mangle/HRNEO_CONNMARK` (переход из `PREROUTING` — `-m addrtype ! --dst-type LOCAL -j HRNEO_CONNMARK`; при `GlobalRouting=true` перед парами — переходы в `HRNEO_OVERRIDE`, §8), через `iptables-restore --noflush` (один вызов на весь батч). Если марку получить не удалось (RCI недоступен, авторизация отклонена, политики нет или `markID` ещё не назначен) — `LOG_WARN`, цель пропускается в этом батче и выставляется `incomplete=1`: остальные цели применяются, но функция возвращает `-1` (`ipset` продолжит заполняться, но трафик этой цели не маркируется до следующего коммита)
 
 13. Инициализируется `AF_PACKET` захват DNS-ответов: два `SOCK_DGRAM/ETH_P_ALL` сокета с L3-BPF (`fd4` для IPv4, `fd6` для IPv6).
 
@@ -73,7 +73,7 @@ HRNeo — демон для policy routing на роутерах Keenetic (Entwa
 
 15. Основной epoll-цикл перехватывает DNS-ответы (`AF_PACKET`) и L7-пакеты (`NFLOG`), добавляет IP в `ipset` через netlink. Для L7-канала при **первом** добавлении IP (и при `ConntrackFlush=true`) триггернувшее соединение разрывается точечным удалением его conntrack-записи по полному 5-tuple (`conntrack_delete_conn`) — следующий пакет переоценивает `CONNMARK`-правила, а смена src/NAT через политику вынуждает легитимный реконнект по выбранному маршруту. Полный conntrack-DUMP (шаг 16) из L7-канала не выполняется — L7 использует точечный DELETE без сканирования таблицы.
 
-16. Если `ConntrackFlush=true` И IP добавлен в `ipset` впервые (`NLM_F_EXCL` вернул `err==0`, а не `IPSET_ERR_EXIST`), IP попадает в pending-буфер `conntrack_flush_request` — conntrack-DUMP выполняется **асинхронно**: неблокирующий сокет `m->fd` зарегистрирован в том же epoll, чанки таблицы читаются между DNS-пакетами, DELETE по совпадению dst-IP уходит fire-and-forget. DNS-события никогда не ждут сканирования таблицы (при burst-резолвах ipset add всех доменов завершается до/независимо от DUMP'а), один DUMP обслуживает все накопленные IP. Реальное удаление происходит только при наличии активной `conntrack`-записи к IP; если соединения ещё нет — DUMP проходит вхолостую.
+16. Если `ConntrackFlush=true` И IP добавлен в `ipset` впервые (`NLM_F_EXCL` вернул `err==0`, а не `IPSET_ERR_EXIST`), IP попадает в pending-буфер `conntrack_flush_request` — conntrack-DUMP выполняется **асинхронно**: неблокирующий сокет `m->fd` зарегистрирован в том же epoll, за одно пробуждение читается не больше `CT_RECV_BUDGET`=8 чанков, остаток — на следующих итерациях epoll, вперемешку с DNS-пакетами (без бюджета ядро досылает следующий чанк прямо в `recvmsg`, и `EAGAIN` до `NLMSG_DONE` не наступает: на MT7621 ~4 100 записей — 45 чтений и 63 мс подряд, ARCH_AUDIT §13); DELETE по совпадению dst-IP уходит fire-and-forget. DNS-события никогда не ждут сканирования таблицы (при burst-резолвах ipset add всех доменов завершается до/независимо от DUMP'а), один DUMP обслуживает все накопленные IP. Реальное удаление происходит только при наличии активной **непромаркированной** `conntrack`-записи к IP: DUMP фильтруется в ядре по `CTA_MARK=0/0xffffffff`. Соединение, которое уже получило марку цели (SYN прошёл после добавления IP) или марку политики ndm, не трогается. Если таких записей нет — DUMP проходит вхолостую.
 
 17. Обрабатываются сигналы:
     - `SIGUSR1` — обновление состояния интерфейсов DirectRoute + восстановление недостающих `CONNMARK`-правил (RCI опрашивается только для целей без правил) + недостающих L7-правил. Правила hrneo пишутся одной командой `iptables-restore --noflush` на семью; идемпотентность — по дампу только разбираемых цепочек (`-S PREROUTING`, при L7 ещё `-S FORWARD`/`-S OUTPUT`), без `iptables -C`. При неактивном цикле коммита запись выполняется **немедленно**, подтверждающая — через `NF_COMMIT_INTERVAL_MS` = 3 с; пока цикл активен, сигналы игнорируются целиком (`timerfd`)
@@ -106,13 +106,15 @@ DNS-ответ (ndnproxy и др.) → клиент (любой интерфей
 [conntrack_flush_request: IP → pending-буфер, старт async DUMP]
    |
    v
-[epoll EPOLLIN на ct-fd → conntrack_process: чанки DUMP между DNS-пакетами,
+[epoll EPOLLIN на ct-fd → conntrack_process: DUMP только записей с mark=0,
  DELETE (fire-and-forget) по совпадению dst-IP с pending]
 
 [Исходящий трафик клиента]
-   → iptables/mangle PREROUTING
-   → CONNMARK set-xmark по ipset dst match
-   → CONNMARK restore-mark
+   → iptables/mangle PREROUTING → addrtype ! LOCAL → HRNEO_CONNMARK
+   → [GlobalRouting=true, nfmark политики ndm, dst в ipset цели]
+     → HRNEO_OVERRIDE: DNS 53 → RETURN; NEW → PPE; ctmark := 0
+   → CONNMARK set-xmark по ipset dst match (connmark = 0)
+   → CONNMARK restore-mark по connmark цели (ORIGINAL, без ipset)
    → ip rule fwmark → table X → default via <gw> dev <interface>
 ```
 
@@ -134,11 +136,11 @@ DNS-ответ (ndnproxy и др.) → клиент (любой интерфей
 | `src/log.c` | Логирование (console/file/syslog/off) |
 | `src/util.c` | Хеш-таблица доменов, chunked pool, fork/exec |
 | `src/rci.c` | HTTP/JSON взаимодействие с API Keenetic |
-| `src/signal_handler.c` | `signal_mgr_t` (signalfd + timerfd manager) |
+| `src/signal_handler.c` | `signal_mgr_t` (signalfd) |
 | `src/geodat.c` | Парсинг GeoIP/GeoSite .dat файлов (protobuf) |
 | `src/probe_tls.c` | Stateless парсер TLS ClientHello → SNI |
 | `src/probe_http.c` | Stateless парсер HTTP request → Host |
-| `src/probe_quic.c` | QUIC CRYPTO-walker: дешифровка Initial-пакета (v1/v2), HKDF + AES-128-CTR, ACK-frame skip → SNI; выдаёт CRYPTO-фрагмент для реассамблеции |
+| `src/probe_quic.c` | QUIC CRYPTO-walker: дешифровка Initial-пакета (v1/v2), HKDF + AES-128-CTR, ACK-frame skip; все CRYPTO-фреймы → сборщик `crypto_asm_t` |
 | `src/quic_crypto.c` | Pure-C SHA-256, HMAC-SHA256, HKDF-Expand-Label, AES-128-ECB/CTR (без AF_ALG, без libcrypto) |
 | `src/bogon.c` | Фильтр служебных IPv4/IPv6 диапазонов |
 | `src/nflog_capture.c` | NFLOG через raw NETLINK_NETFILTER (subsys ULOG=4, без libnetfilter_log) |
@@ -205,11 +207,11 @@ int                     g_l7_active;
 char                    g_l7_wan[MAX_INTERFACE_NAME];
 tcp_reasm_t             g_reasm;
 int                     g_reasm_active;
-int                     g_commit_active;            // цикл коммитера netfilter активен
 const char             *g_cfg_path = DEFAULT_CONFIG_PATH;
 char                    g_policy_names[MAX_POLICY_ORDER][64];
 int                     g_policy_names_count;
 int                     g_policies_pending;         // rci_create_policies не прошёл — повтор на коммите
+struct { pthread_t thread; int running, req_fd, timer_fd, stop_fd, heal_fd; } g_nf;  // поток коммитера (раздел 9)
 ```
 
 ### `main()` — последовательность старта
@@ -241,15 +243,16 @@ int                     g_policies_pending;         // rci_create_policies не 
 16. `add_cidr_to_ipsets()` — если `CIDR=true` и `cidr_file_path` задан
 17. `build_geosite_domain_map()` — если `gs_count > 0` (правила `geosite:` распарсены один раз на шаге 10 и переиспользуются)
 18. `drm_setup_all_routes()` — `ip rule` + `ip route` для DirectRoute
-19. Если `conntrack_flush` — `conntrack_mgr_init()` (при ошибке flush отключается)
+19. Если `GlobalRouting=true` и `ppe_target_available()` не находит цель `PPE` в `/proc/net/ip{,6}_tables_targets` — `LOG_ERROR`, `global_routing = 0` (§8). Если `conntrack_flush` — `conntrack_mgr_init()` (при ошибке flush отключается)
 20. `pkt_capture_init()` — два `AF_PACKET SOCK_DGRAM/ETH_P_ALL` сокета (`fd4`, `fd6`)
-21. Если `l7_capture_enabled`: `l7_firewall_resolve_wan` (при неудаче — L7 отключается с `LOG_WARN`, DNS-only); `l7_firewall_load_nflog_modules` (`nfnetlink_log`+`xt_NFLOG` через `init_module(2)`; при неудаче — L7 отключается, DNS-only, **без fallback**). Иначе: `l7_firewall_load_kmod("xt_connbytes")`; `l7_dispatch_set_enable` (с флагами tls/http/quic); при `l7_tcp_reasm_enabled` — `tcp_reasm_init` + `l7_dispatch_set_reasm` (`g_reasm_active=1`); `nflog_capture_init` → `g_l7_active=1`. Правила NFLOG **не ставятся здесь** — они входят в общий batch коммитера (шаг 24)
-22. `signal_mgr_init()` — `sigprocmask` + `signalfd` + `timerfd`
-23. `epoll_create1()` — регистрация `cap.fd4`, `cap.fd6`, `signals.sig_fd`, `signals.timer_fd`; при активном conntrack flush — `g_conntrack.fd` (async DUMP); при `g_l7_active` — `nflog_fd`; при `g_reasm_active` — `reasm_gc_fd` (`timerfd` 1s)
+21. Если `l7_capture_enabled`: `l7_firewall_resolve_wan` (при неудаче — L7 отключается с `LOG_WARN`, DNS-only); `l7_firewall_load_nflog_modules` (`nfnetlink_log`+`xt_NFLOG` через `init_module(2)`; при неудаче — L7 отключается, DNS-only, **без fallback**). Иначе: `load_kmod("xt_connbytes")`; `l7_dispatch_set_enable` (с флагами tls/http/quic); при `l7_tcp_reasm_enabled` — `tcp_reasm_init` + `l7_dispatch_set_reasm` (`g_reasm_active=1`); `nflog_capture_init` → `g_l7_active=1`. Правила NFLOG **не ставятся здесь** — они входят в общий batch коммитера (шаг 24)
+22. `signal_mgr_init()` — `sigprocmask` + `signalfd`
+22a. `nf_start()` — `eventfd` запроса, остановки и лечения, `timerfd` повтора и поток коммитера (раздел 9). При ошибке — выход
+23. `epoll_create1()` — регистрация `cap.fd4`, `cap.fd6`, `signals.sig_fd`; при активном conntrack flush — `g_conntrack.fd` (async DUMP) и `g_nf.heal_fd`; при `g_l7_active` — `nflog_fd`; при `g_reasm_active` — `reasm_gc_fd` (`timerfd` 1s)
 23a. `wlapi_start(WATCHLIST_SOCKET, g_all_targets)` — сокет watchlist API и его поток (раздел 20). Последний шаг инициализации: к этому моменту watchlist загружен полностью. При ошибке — `LOG_WARN`, демон работает без API
-24. `commit_start()` — первый коммит netfilter (тот же путь, что и по SIGUSR1, с тем же ретраем через фиксированные 3 с)
+24. `eventfd_write(g_nf.req_fd, 1)` — первый коммит netfilter в потоке коммитера (тот же путь, что и по SIGUSR1, с тем же ретраем через фиксированные 3 с)
 25. Основной цикл `epoll_wait` (`events[8]`)
-26. **Cleanup:** `wlapi_stop` (поток API останавливается до `ht_destroy`) → `signal_mgr_close` → `l7_firewall_remove` + `nflog_capture_close` → `tcp_reasm_close` (если `g_reasm_active`) → `pkt_capture_close` → `conntrack_mgr_close` → `drm_cleanup_all_routes` → `cleanup_connmark_rules` → `ipset_manager_close` → `ht_destroy` → `remove_pid_file` → `log_close`
+26. **Cleanup:** `wlapi_stop` (поток API останавливается до `ht_destroy`) → `nf_stop` (поток коммитера доделывает запись и останавливается до снятия правил) → `signal_mgr_close` → `l7_firewall_remove` + `nflog_capture_close` → `tcp_reasm_close` (если `g_reasm_active`) → `pkt_capture_close` → `conntrack_mgr_close` → `drm_cleanup_all_routes` → `cleanup_connmark_rules` → `ipset_manager_close` → `ht_destroy` → `remove_pid_file` → `log_close`
 
 ---
 
@@ -316,6 +319,8 @@ dns_result_t {
 
 #define DNS_MAX_ANSWERS  128
 #define DNS_MAX_CNAMES    32
+#define DNS_REPEAT_RING   32
+#define DNS_REPEAT_WINDOW_MS 2000
 ```
 
 ### `extract_dns_payload(pkt, pkt_len, dns_len)`
@@ -331,11 +336,15 @@ dns_result_t {
 1. Проверяет `DNS_FLAG_QR` (response)
 2. Пропускает Question-секцию
 3. Итерирует Answer-секцию: `TypeA` → `answers[]`, `TypeAAAA` → `answers[]`, `TypeCNAME` → `cnames[]`
-4. `dns_decode_name`: декодирует DNS-имена с поддержкой compression pointers (до 128 hop защиты)
+4. `dns_decode_name`: декодирует DNS-имена с поддержкой compression pointers (до 128 hop защиты); имя, не помещающееся в буфер (255 символов), отвергается целиком (`-1`), а не обрезается
+
+### `dns_result_repeat(result, now_ms)`
+
+Подавляет повторную обработку одного и того же разрешения имени. Ключ — сумма 64-битных хешей пар «имя → IP» (A/AAAA) и «CNAME → цель» плюс число записей: от порядка записей, txid и TTL не зависит. Кольцо `DNS_REPEAT_RING=32` пар `{ключ, время}`: ключ, обработанный меньше `DNS_REPEAT_WINDOW_MS=2000` мс назад, — повтор. Окно отсчитывается от **первой** обработки и при попадании не сдвигается: ответ, повторяющийся чаще раза в 2 с, всё равно обрабатывается раз в 2 с (иначе не срабатывало бы продление таймаута своих элементов ipset, §7). Повторы — копии одного ответа на `br0`/портах моста и ответы разных апстримов ndnproxy на WAN: на один запрос клиента 7–11 обработок, ключ оставляет одну (ARCH_AUDIT §8.5, §9.5, §10.6)
 
 ### `process_dns_packet(pkt, pkt_len, user_data)` (`main.c`)
 
-1. `extract_dns_payload` + `dns_parse_response` → `dns_result_t` (статическая переменная в функции)
+1. `extract_dns_payload` + `dns_parse_response` → `dns_result_t` (статическая переменная в функции); ответ без A/AAAA и повтор (`dns_result_repeat`, `CLOCK_MONOTONIC` в мс) отбрасываются до сопоставления с watchlist и netlink
 2. Итерирует уникальные домены (`processed[64][256]` на стеке) — для каждого:
    - Сбор IPv4/IPv6 батчей из `answers` (до 32 каждого семейства)
    - `process_hostname_event(domain, result.cnames, result.cname_count, ..., "DNS")` — общий хелпер с L7-каналом; CNAME-записи передаются как `dns_cname_t` напрямую из результата парсинга, без промежуточного копирования
@@ -344,10 +353,10 @@ dns_result_t {
 
 Возвращает `int` — число реально добавленных (новых) IP (`all_new_count`).
 
-1. `match_domain_with_cname` → `ipset_name` (или `NULL` — пропуск)
+1. `match_domain_with_cname` → цель `const ht_target_t *` (или `NULL` — пропуск); имя множества — `target->name`
 2. `LOG_MATCH "[<tag>] <domain> -> <ipset>"` (или `"<domain> via <matched_domain> -> <ipset>"` при CNAME)
-3. `ipset_add_batch` для IPv4 (`setname`, `with_timeout=1`)
-4. `ipset_add_batch` для IPv6 (`setname + "v6"`, `with_timeout=1`)
+3. `ipset_add_batch` для IPv4 (`setname`, `owner = target->rank`)
+4. `ipset_add_batch` для IPv6 (`setname + "v6"`, `owner = target->rank`; семья различает слоты IPv4/IPv6)
 5. `LOG_PROCESSED` для каждого реально добавленного (нового) IP
 6. `conntrack_flush_request()` если `allow_conntrack_flush=1` И `conntrack_flush=1` И есть новые IP — новые IP кладутся в pending-буфер, DUMP+DELETE выполняются асинхронно в epoll-цикле (`conntrack_process`), обработка DNS не блокируется. DNS-канал передаёт `allow_conntrack_flush=1`; L7-канал — `0` (полный DUMP за L7 не выполняется, вместо него — точечный DELETE по 5-tuple в `process_hostname_event_l7`).
 
@@ -368,7 +377,7 @@ dns_result_t {
 
 ### `match_domain_with_cname(ht, domain, cnames, cname_count, matched_domain)`
 
-BFS-обход CNAME-цепочки (до `MAX_CNAME_CHAIN=16` шагов). Поиск двунаправленный: для каждого текущего домена проверяются как `cnames[i].source == current` (forward), так и `cnames[i].target == current` (backward). Защита от циклов через `visited_hashes` (FNV-1a). Обходится вся цепочка: из совпадений на разных её узлах выбирается цель с минимальным `rank` — тот же порядок, что у правил CONNMARK. Ранний выход — только при `rank == 0` (лучше не бывает). Возвращает имя цели и `matched_domain` (через out-параметр) выбранного узла.
+BFS-обход CNAME-цепочки (до `MAX_CNAME_CHAIN=16` шагов). Поиск двунаправленный: для каждого текущего домена проверяются как `cnames[i].source == current` (forward), так и `cnames[i].target == current` (backward). Защита от циклов через `visited_hashes` (FNV-1a). Обходится вся цепочка: из совпадений на разных её узлах выбирается цель с минимальным `rank` — тот же порядок, что у правил CONNMARK. Ранний выход — только при `rank == 0` (лучше не бывает). Возвращает выбранную цель (`const ht_target_t *`: имя и ранг; ранг нужен `ipset_add_batch` как владелец элемента) и `matched_domain` (через out-параметр) выбранного узла.
 
 ### `parse_watchlist_lines(path, on_target, on_domain, user)`
 
@@ -402,7 +411,7 @@ BFS-обход CNAME-цепочки (до `MAX_CNAME_CHAIN=16` шагов). По
 работает по единому массиву без различия типов, `get_policy_priority` — по
 одному имени. Работает на **ДВУХ уровнях независимо**:
 
-**1) Порядок CONNMARK-правил в `iptables/mangle/PREROUTING`**
+**1) Порядок CONNMARK-правил в `iptables/mangle/HRNEO_CONNMARK`**
 
 `main` вызывает `sort_policies` дважды: для `policy_names` (для `rci_create_policies`) и для объединённого `all_names` (policy + iface вместе) — результат пишется в `g_all_sorted[]`. `apply_unified_connmark_rules` итерирует этот массив последовательно и добавляет правила `CONNMARK` в этом порядке через `iptables-restore --noflush`. Поскольку `iptables` проверяет правила сверху вниз и берёт первое совпадение, при попадании пакета в несколько `ipset` одновременно (например, IP принадлежит сразу `/HydraRoute` и `/RU` в `ip.list`, или один IP пришёл в DNS-ответах разных доменов разных политик) выигрывает цель, стоящая раньше в `PolicyOrder`.
 
@@ -462,8 +471,11 @@ struct pool_chunk {
 - `trim_whitespace()` — обрезка пробелов
 - `fnv1a_hash()` — inline в `hrneo.h`
 - `mkdir_p()` — рекурсивное создание каталогов
-- `run_command_output()` — `fork`/`execvp` с захватом `stdout`+`stderr`
-- `run_command_stdin()` — `fork`/`execvp` с подачей `stdin`
+- `run_command_output()` — `fork`/`execvp` с захватом `stdout`+`stderr`; вывод длиннее буфера — `-1`
+- `run_command_stdin()` — `fork`/`execvp` с подачей `stdin`, вывод отбрасывается
+- Потомок до `execvp` сбрасывает маску сигналов (поток коммитера блокирует все) и возвращает `SIGPIPE` в `SIG_DFL` (демон его игнорирует): `iptables`, `ip`, `ndmc` получают обычную среду сигналов
+- Общее ядро `run_child`: каналы `O_CLOEXEC` (родительский конец `stdin` неблокирующий), `poll` по выводу и вводу одновременно, дедлайн `CHILD_DEADLINE_MS`=10 с от запуска. Не уложился — `SIGKILL`, `LOG_WARN "<cmd>: no exit within … ms, killed"`, возврат `-1` (коммит неуспешен, повтор через 3 с). Так ограничено ожидание xtables-lock: `iptables -w` 1.4.21 без числа секунд ждёт бесконечно с шагом 1 с, а `-w <сек>` прошивка не принимает (ARCH_AUDIT §8.1). Потомок, закрывший вывод, но не завершившийся, тоже убивается по дедлайну
+- `thread_start_masked()` — `pthread_create` с полностью заблокированной маской сигналов (потоки watchlist API и коммитера)
 
 ---
 
@@ -474,10 +486,14 @@ struct pool_chunk {
 | Поле | Назначение |
 |------|------------|
 | `fd` `int` | netlink-сокет (`NETLINK_NETFILTER`, long-lived) |
-| `seq`, `pid` | для netlink-сообщений |
+| `seq`, `pid` | для netlink-сообщений; по `seq` ответы сопоставляются с запросами |
 | `default_timeout` | единый timeout (сек) для DNS-path ADD всех сетов; 0 = без timeout. Устанавливается в `main` из `IpsetEnableTimeout`/`IpsetTimeout` |
 | `set_names[IPSET_MAX_SETS=512][64]` | кэш имён существующих ipset |
 | `set_count` | количество кэшированных имён |
+
+### Обмен с ядром: `nl_exchange`
+
+Все запросы (CREATE, TYPE, FLUSH, TEST, пачки ADD) идут без `NLM_F_ACK`: ядро отвечает только на ошибку, а TYPE — сообщением с атрибутами. Пачка из `n` сообщений с последовательными `nlmsg_seq` уходит одним `send`. nfnetlink обрабатывает все сообщения skb синхронно внутри `sendmsg` (`netlink_rcv_skb`), поэтому после возврата `send` все ответы уже в очереди сокета: они вычитываются `recv(MSG_DONTWAIT)` до `EAGAIN`, сокет никогда не блокирует. Ответ относится к сообщению `nlmsg_seq − seq0`, ответы вне диапазона (остатки прошлых обменов) отбрасываются. Нет ответа — успех. `ENOBUFS` (ядро выбросило ответы при переполнении rcvbuf) → `LOG_WARN`, все сообщения без полученной ошибки считаются неизвестными (`-1`): не «новые» и не «свои». `nl_request` — обёртка для одного сообщения.
 
 ### `ipset_create(mgr, name, type, family, timeout, maxelem)`
 
@@ -488,23 +504,27 @@ struct pool_chunk {
 - Прочие ошибки: `LOG_ERROR` + возврат `errno`
 - При успехе: `LOG_DEBUG "Set %s created"`, добавляет в `set_names` кэш
 
+### `ipset_test(mgr, name, entry)`
+
+`IPSET_CMD_TEST` через netlink (тот же построитель `build_ipset_adt_msg`, что у ADD, без таймаута) — 1, если адрес есть в множестве. Ядро отвечает 0 при наличии и `IPSET_ERR_EXIST` при отсутствии. Для `hash:net` и маски хоста проверяются все длины префикса множества (как в пакетном пути `-m set`; на KeeneticOS проверено: адрес внутри `/24` из `HR` находится). Используется самовосстановлением conntrack (§14).
+
 ### `ipset_flush(mgr, name)`
 
 `IPSET_CMD_FLUSH` через netlink.
 
-### `ipset_add_batch(mgr, set_name, entries, count, with_timeout, new_count, new_indices)`
+### `ipset_add_batch(mgr, set_name, entries, count, owner, new_count, new_indices)`
 
 1. `has_timeout = mgr->default_timeout > 0`
-2. Фильтрует service IP через `is_service_ip()` (`LOG_FILTERED`)
-3. Формирует netlink-сообщения через `build_ipset_add_msg()`: `TIMEOUT`-атрибут добавляется при `has_timeout=1`; значение = `default_timeout` при `with_timeout=true`, иначе явный `0` (постоянная запись CIDR-пути)
-4. Чанки по `IPSET_CHUNK_SIZE=256`: send все сообщения чанка, затем recv все ответы
-5. `with_timeout=true`: `NLM_F_EXCL` (повторное добавление → `IPSET_ERR_EXIST` без обновления `timeout`); `new_indices` заполняется только при `with_timeout=true`
-6. `with_timeout=false`: `NLM_F_CREATE` без `NLM_F_EXCL`; `new_indices` не заполняется
-7. Обработка ошибок netlink ack:
-   - `err->error == 0` → запись добавлена, индекс пишется в `new_indices` при `with_timeout=1`
+2. Фильтрует service IP через `is_service_ip()` (`LOG_FILTERED`). При включённом таймауте пропускает и свои свежие элементы: слот `g_owned` принадлежит этому `owner`/семье/IP и `now < refresh_at` — ADD не формируется вовсе (повторные ответы популярных имён не делают системных вызовов). Удалённый вручную (`ipset del`/`flush`) свой элемент поэтому возвращается не раньше `refresh_at`
+3. Формирует netlink-сообщения через `build_ipset_adt_msg()` подряд в одном статическом буфере (`IPSET_CHUNK_SIZE × IPSET_ADT_MSG_MAX`): `TIMEOUT`-атрибут добавляется при `has_timeout=1`; значение = `default_timeout` для DNS/L7 (`owner` = ранг цели), иначе явный `0` (постоянная запись CIDR-пути, `owner = IPSET_PERMANENT`)
+4. Чанки по `IPSET_CHUNK_SIZE=256`: чанк — один `send` и разбор ответов по `seq` (`send_adds` → `nl_exchange`)
+5. DNS/L7: `NLM_F_EXCL` (повторное добавление → `IPSET_ERR_EXIST`, ядро таймаут не трогает); `new_indices` заполняется только здесь
+6. `IPSET_PERMANENT`: `NLM_F_CREATE` без `NLM_F_EXCL`; `new_indices` не заполняется (`new_count`/`new_indices` могут быть `NULL`)
+7. Результат сообщения:
+   - нет ответа (0) → запись добавлена, индекс пишется в `new_indices`; при включённом таймауте слот таблицы «своих» элементов (`g_owned[IPSET_OWNED_SLOTS=4096]`, прямое отображение по хешу IP и `owner`) занимается этим элементом, `refresh_at = now + timeout/2`
+   - `IPSET_ERR_EXIST` (4103) → если слот принадлежит этому же `owner`/семье/IP (свежие отсеяны в п. 2, значит `now ≥ refresh_at`), элемент уходит во второй `send_adds` **без** `NLM_F_EXCL`: ядро переписывает таймаут (продление, проверено на KeeneticOS — ARCH_AUDIT §8.2/§10.2). Чужие элементы (постоянные из `ip.list`/GeoIP, оставшиеся от прошлого запуска) не продлеваются: ADD без `EXCL` сделал бы постоянный элемент временным
    - `IPSET_ERR_HASH_FULL` (4101) → `LOG_WARN "ipset '%s' full"`
-   - `IPSET_ERR_EXIST` (4103) → молча игнорируется
-   - Прочие коды → `LOG_DEBUG "Netlink ADD error: errno=%d"`
+   - Прочие коды → `LOG_DEBUG "Netlink ADD error: errno=%d"`; `-1` (ответы потеряны, `ENOBUFS`) — молча, элемент не «новый» и не «свой»
 
 ### Прочие функции
 
@@ -525,29 +545,100 @@ struct pool_chunk {
 
 **Файл:** `src/iptables.c`, функция `apply_unified_connmark_rules()`.
 
-1. Оба семейства обрабатываются единым кодом через массив дескрипторов `connmark_family_t[2]` (`{ipt_cmd, restore_cmd, dump, batch}`: `iptables`/`iptables-restore` и `ip6tables`/`ip6tables-restore`); для каждого семейства читаются **только разбираемые цепочки**: `-w -t mangle -S PREROUTING`, а при включённом L7 дополнительно `-S FORWARD` и `-S OUTPUT`, склеенные в один буфер. Полная таблица не читается: её объём задаёт роутер (по 3 правила `_NDM_HOTSPOT_PREROUTING_MANGL` на каждую привязку устройства к политике). Ошибка или обрезание вывода → `-1`
-2. Дамп читается **до** обращений к RCI. IPv6-правила ставятся для всех целей, политик и интерфейсов, независимо от наличия IPv6 на роутере: без IPv6-клиентов они просто не срабатывают, а при появлении IPv6 (переподключение провайдера, ручная настройка сегмента) маршрутизация уже предсказуема. Для каждой цели `scan_rules()` по дампу каждого семейства (строка обязана начинаться с `-A PREROUTING ` и содержать `--match-set <ipset> dst `) находит обе строки пары: `--set-xmark` (вместе с маркой) и `--restore-mark`. Цель **цела**, если в семействе есть обе строки
+1. Оба семейства обрабатываются единым кодом через массив дескрипторов `connmark_family_t[2]` (`{ipt_cmd, restore_cmd, dump, batch}`: `iptables`/`iptables-restore` и `ip6tables`/`ip6tables-restore`); для каждого семейства читаются **только разбираемые цепочки**: `-w -t mangle -S PREROUTING` и `-S HRNEO_CONNMARK`, а при включённом L7 дополнительно `-S FORWARD` и `-S OUTPUT`, склеенные в один буфер. Полная таблица не читается: её объём задаёт роутер (по 3 правила `_NDM_HOTSPOT_PREROUTING_MANGL` на каждую привязку устройства к политике). Ошибка или обрезание вывода → `-1`; ошибка `-S HRNEO_CONNMARK` означает «цепочки нет» (ndm переписал таблицу) и запускает перестройку
+2. Дамп читается **до** обращений к RCI. IPv6-правила ставятся для всех целей, политик и интерфейсов, независимо от наличия IPv6 на роутере: без IPv6-клиентов они просто не срабатывают, а при появлении IPv6 (переподключение провайдера, ручная настройка сегмента) маршрутизация уже предсказуема. Для каждой цели `scan_rules()` по дампу каждого семейства (строка обязана начинаться с `-A HRNEO_CONNMARK `) находит обе строки пары. Строку маркировки — по хвосту `-m set --match-set <ipset> dst -j CONNMARK --set-xmark 0x` (`XMARK_TAIL`), из неё же берётся марка. Строку восстановления имени множества нет, её ищут по этой марке: `-m connmark --mark 0x<марка> -m conntrack --ctdir ORIGINAL -j CONNMARK --restore-mark …` (`RESTORE_RULE`, в таком виде её печатает `-S` iptables 1.4.21 — маска `/0xffffffff` опускается). Генерация и разбор используют одни и те же макросы. Цель **цела**, если в семействе есть обе строки
 3. markID запрашивается **лениво**: только если строки `--set-xmark` хотя бы в одном семействе нет — либо если идёт `startup_audit`, режим первого успешного коммита. Интерфейсные цели RCI не используют вовсе (`mark = fwmark`). Если все цели целы и аудит уже пройден, сетевых вызовов нет и `iptables-restore` не запускается
    - `RCI_MARK_TRANSPORT` / `RCI_MARK_DENIED` → `incomplete=1`; уже стоящие правила цели сохраняются со своей маркой
    - `RCI_MARK_ABSENT` → `incomplete=1`, оставшиеся правила цели удаляются как осиротевшие: политики уже нет, а её markID Keenetic выдаст следующей созданной политике (docs/MARKID_DRIFT.md)
-4. **Перестройка семейства в порядке `PolicyOrder`.** Правила добавляются через `-A`, то есть в конец цепочки, поэтому дописать одну недостающую цель значит поставить её ниже всех остальных и нарушить приоритет. Если в семействе нарушена хотя бы одна цель (нет обеих строк или одной из них) и её правила можно восстановить (марка известна из RCI, `fwmark` или уцелевшей строки `--set-xmark`), семейство перестраивается целиком: в batch сначала идут `-D` на каждую строку правил hrneo из дампа, затем `-A` для всех целей в порядке `g_all_sorted[]`. Это один вызов `iptables-restore --noflush`, поэтому замена атомарна: окна без правил нет. Чужие правила цепочки не трогаются. При `startup_audit` перестраиваются оба семейства, заодно сверяются марки с RCI и исправляется порядок, оставшийся от прошлых запусков. Цель, которую добавить нельзя (RCI недоступен, политики нет), перестройку не запускает, иначе коммитер гонял бы её каждые 3 с вхолостую
-5. Если L7 активен — `l7_firewall_emit_rules()` дописывает недостающие NFLOG-правила `FORWARD`/`OUTPUT` **в тот же batch** (наличие определяется по тому же дампу)
-6. Каждый непустой batch → один вызов `iptables-restore --noflush` / `ip6tables-restore --noflush`. Ненулевой код возврата или переполнение batch → `-1`
-7. Возврат: `0` — таблица приведена в целевое состояние полностью; `-1` — коммитер повторит через 3 с
+4. **Перестройка семейства в порядке `PolicyOrder`.** Правила добавляются через `-A`, то есть в конец цепочки, поэтому дописать одну недостающую цель значит поставить её ниже всех остальных и нарушить приоритет. Если в семействе нарушена хотя бы одна цель (нет обеих строк или одной из них) и её правила можно восстановить (марка известна из RCI, `fwmark` или уцелевшей строки `--set-xmark`), семейство перестраивается целиком: в batch сначала идёт `:HRNEO_CONNMARK - [0:0]` (в `--noflush` создаёт цепочку или очищает существующую), затем `-A` для всех целей в порядке `g_all_sorted[]`. Это один вызов `iptables-restore --noflush`, поэтому замена атомарна: окна без правил нет. Цепочка принадлежит только hrneo; `PREROUTING` и чужие правила не трогаются. Отсутствие цепочки — тоже повод для перестройки. При `startup_audit` перестраиваются оба семейства, заодно сверяются марки с RCI и исправляется порядок, оставшийся от прошлых запусков. Цель, которую добавить нельзя (RCI недоступен, политики нет), перестройку не запускает, иначе коммитер гонял бы её каждые 3 с вхолостую
+5. Если в дампе `PREROUTING` нет строки, оканчивающейся на `-j HRNEO_CONNMARK`, в batch добавляется переход `-A PREROUTING -m addrtype ! --dst-type LOCAL -j HRNEO_CONNMARK`. `xt_addrtype` грузится (`load_kmod`, `init_module(2)`) при первом вызове; если модуль недоступен — `LOG_WARN` и переход без предфильтра. Предфильтр снимает оба поиска в ipset со всех пакетов к самому роутеру (`lo`, внешние пакеты VPN-туннелей — 99,4–99,9 % PREROUTING на KeeneticOS, ARCH_AUDIT §8.3/§10.5), а `addrtype` проверяется один раз на пакет, независимо от числа целей
+6. Если L7 активен — `l7_firewall_emit_rules()` дописывает недостающие NFLOG-правила `FORWARD`/`OUTPUT` **в тот же batch** (наличие определяется по тому же дампу)
+7. Каждый непустой batch → один вызов `iptables-restore --noflush` / `ip6tables-restore --noflush`. Ненулевой код возврата или переполнение batch → `-1`
+8. Возврат: `0` — таблица приведена в целевое состояние полностью; `-1` — коммитер повторит через 3 с. Out-параметр `restored` = 1, если вне стартового аудита записан батч с перестройкой цепочки или переходом (правил не было — окно «ndm переписал таблицу»); по нему `perform_update` запускает `conntrack_heal_request` (§14)
 
-#### Правила CONNMARK (`GlobalRouting=false`)
+#### Правила CONNMARK
 
 ```
--A PREROUTING -m mark ! --mark 0xffffaa0/0xffffff0
-   -m connmark --mark 0x0/0xffffffff
+-A PREROUTING -m addrtype ! --dst-type LOCAL -j HRNEO_CONNMARK
+
+-A HRNEO_CONNMARK -m connmark --mark 0x0/0xffffffff
    -m set --match-set <ipset> dst
    -j CONNMARK --set-xmark 0x<mark>/0xffffffff
 
--A PREROUTING -m set --match-set <ipset> dst
+-A HRNEO_CONNMARK -m connmark --mark 0x<mark>
+   -m conntrack --ctdir ORIGINAL
    -j CONNMARK --restore-mark --nfmask 0xffffffff --ctmask 0xffffffff
 ```
 
-`GlobalRouting=true`: условие `! --mark 0xffffaa0/0xffffff0` убирается.
+Пара на цель, в порядке `g_all_sorted[]`. При `GlobalRouting=true` перед всеми
+парами идут переходы в `HRNEO_OVERRIDE` (см. ниже).
+
+#### `GlobalRouting=true`: перекрытие привязки устройства
+
+```
+-A HRNEO_CONNMARK -m mark --mark 0xffffa00/0xfffff00 -m set --match-set <ipset> dst -j HRNEO_OVERRIDE   # на цель, перед всеми парами
+
+-A HRNEO_OVERRIDE -p tcp -m tcp --dport 53 -j RETURN
+-A HRNEO_OVERRIDE -p udp -m udp --dport 53 -j RETURN
+-A HRNEO_OVERRIDE -m conntrack --ctstate NEW -j PPE
+-A HRNEO_OVERRIDE -j CONNMARK --set-xmark 0x0/0xffffffff
+```
+
+- ndm в `_NDM_HOTSPOT_PREROUTING_MANGL` (v6 `_NDM_HOTSPOT_PRERT`) на **каждом**
+  пакете привязанного устройства делает `MARK` + `CONNMARK --save-mark` марки
+  политики, поэтому guard пары такое соединение не пропускает. Переход
+  распознаёт пакет привязанного устройства по nfmark из ряда марок ndm
+  (`0xffffa00/0xfffff00`: политики выдаются подряд от `0xffffaaa`, рядом
+  служебные марки ndm; ни fwmark DirectRoute `0x3001`, ни марки nfqws2 в ряд не
+  попадают). Подцепочка сбрасывает ctmark в 0, и дальше действует обычный guard:
+  выигрывает первая по `PolicyOrder` цель.
+- Переходы стоят **все перед парами**. После restore nfmark становится маркой
+  цели из того же ряда, и переход, стоящий после пары, сбросил бы её снова —
+  выиграла бы последняя цель.
+- Пакет устройства без привязки отсекается первым же `-m mark` (nfmark 0),
+  привязанного — одним поиском в ipset на цель.
+- `--dport 53` → `RETURN`: DNS остаётся на DNS-прокси политики устройства
+  (`nat/_NDM_HOTSPOT_DNSREDIR` по nfmark; в IPv6 — к любому адресу).
+- `PPE` на первом пакете соединения: ndm возвращает ctmark политики вне
+  iptables (по MAC, который хранит запись conntrack), и FASTNAT вёл бы
+  разгруженный поток по ней — с NAT, уже сделанным через цель. `PPE` исключает
+  соединение из FASTNAT, его разгружают `swnat`/`hw_nat`, которые следуют
+  реальному маршруту. Без `PPE` на 5.1.5 рвалось ~1/3 TCP и 100 % UDP, с
+  `PPE` — 0, CPU 8 % против 11–14 % (ISSUE_107_GLOBALROUTING.md, план §R1).
+  `PPE` — не терминирующая цель без опций. В начале цепочки `--ctstate NEW`
+  совпадает только с первым пакетом. При старте `ppe_target_available()`
+  проверяет её наличие в `/proc/net/ip{,6}_tables_targets`; нет — `ERROR` и
+  `GlobalRouting` выключается.
+- Строки перехода и тело подцепочки участвуют в перестройке семейства: при
+  `GlobalRouting=true` отсутствие перехода цели делает её «сломанной», batch
+  начинается с `:HRNEO_CONNMARK`, `:HRNEO_OVERRIDE` и тела подцепочки.
+  `cleanup_connmark_rules(global_routing)` снимает обе цепочки.
+
+#### Восстановление марки по connmark, а не по ipset
+
+Поиск в ipset делает только правило маркировки, и только для соединений
+с connmark = 0. Пакеты уже промаркированного соединения проходят правило
+восстановления своей цели по двум сравнениям целых чисел. Это важно для IPv6
+в туннели политик: такой трафик не ускоряют ни FASTNAT, ни `hw_nat` (IPv6
+напрямую через WAN `hw_nat` ускоряет), поэтому цепочку проходит каждый
+исходящий пакет (ACK закачек), и раньше каждый делал поиск в `<ipset>v6` — ~15 мкс на MT7621
+при 34 длинах префикса (IPV6_CONNMARK_COST.md §6.2). Правило с `connmark` +
+`conntrack` стоит ≤ 1 мкс.
+
+- `--ctdir ORIGINAL` — марка ставится только на пакеты исходящего направления.
+  Раньше это давал `--match-set <ipset> dst` (dst ответа — клиент, его в
+  множестве нет). Ответы через туннель политики с NAT отсекает и предфильтр
+  `addrtype` (их dst — адрес роутера), но цели DirectRoute без трансляции и
+  переход без `addrtype` (нет `xt_addrtype`) держатся на `--ctdir`.
+- Матчи `connmark` и `conntrack` встроены в ядро KeeneticOS (MT7621 и MT7986,
+  `/proc/net/ip*_tables_matches`), `load_kmod` для них не нужен.
+- Соединения, промаркированные не hrneo (привязка устройства к политике
+  Keenetic по MAC, `0xffffaaX`), при `GlobalRouting=false` правила hrneo не трогают: раньше они
+  делали поиск на каждом пакете и восстанавливали ту же марку вхолостую.
+- Соединение доживает в цели, даже если `dst` выпал из множества по
+  `IpsetTimeout` посреди сессии: восстановление зависит только от connmark.
+  Раньше пакеты теряли марку и уходили мимо политики, и соединение рвалось
+  на другом NAT.
 
 #### Guard `-m connmark --mark 0x0/0xffffffff`
 
@@ -571,9 +662,15 @@ struct pool_chunk {
 перемаркировывались на каждом пакете — теперь поведение общее.
 
 Уровнем выше стоит **привязка устройства к политике в самом Keenetic**:
-`ndm` ставит марк `0xffffaaX` до правил hrneo, и условие
-`! --mark 0xffffaa0/0xffffff0` заставляет hrneo уступить целиком. `PolicyOrder`
-на этот уровень не влияет — снимается только `GlobalRouting=true`.
+`ndm` на каждом пакете ставит марк `0xffffaaX` и сохраняет его в соединении до
+правил hrneo, и guard такое соединение не пропускает. `PolicyOrder` на этот
+уровень не влияет — перекрывает его только `GlobalRouting=true` (выше). Для
+привязанного устройства при `GlobalRouting=true` решение пересматривается на
+каждом пакете, который проходит правила: соединение, уже открытое через политику
+или ушедшее в цель ниже по порядку, переходит в цель, в которую позже попал
+адрес, и рвётся на смене NAT. В IPv4 такие соединения обычно уже разгружены
+FASTNAT (правила видят ~6 первых пакетов) и доживают на прежнем маршруте; в
+IPv6 FASTNAT нет, и переход происходит на следующем пакете.
 
 #### `unified_target_t` (`include/iptables.h`)
 
@@ -585,7 +682,7 @@ struct pool_chunk {
 
 `g_all_sorted[]` объединяет политики и интерфейсы в единый отсортированный массив.
 
-`cleanup_connmark_rules(pairs, count)`: удаляет CONNMARK-правила из `mangle/PREROUTING`.
+`cleanup_connmark_rules(global_routing)`: удаляет переход из `mangle/PREROUTING` (по `-j HRNEO_CONNMARK`), затем `-F` и `-X` цепочки `HRNEO_CONNMARK`, а при `GlobalRouting=true` — и `HRNEO_OVERRIDE`, в обоих семействах.
 
 ### Б) DirectRoute (прямая маршрутизация на интерфейс)
 
@@ -669,69 +766,47 @@ ip -4|-6 route   replace blackhole default table <tableID>    # если DOWN
 
 ---
 
-## 9. Обработчик сигналов: `src/signal_handler.c`
+## 9. Сигналы и коммитер netfilter: `src/signal_handler.c` + `src/main.c`
 
-`signal_mgr_t { sig_fd, timer_fd }` — один контейнер для `signalfd` и `timerfd` коммитера.
+`signal_mgr_t { sig_fd }`: `signal_mgr_init` повторяет `sigprocmask(SIG_BLOCK)` для `SIGINT`/`SIGTERM`/`SIGUSR1` (`main` уже блокирует) и открывает `signalfd(SFD_CLOEXEC)`; `signal_mgr_close` закрывает fd.
 
-### `signal_mgr_init(m)`
+### Поток коммитера (`nf_*` в `main.c`)
 
-- `sigprocmask(SIG_BLOCK, ...)` повторно (`main` уже блокирует) — защита
-- `signalfd(SFD_CLOEXEC)` → `m->sig_fd`
-- `timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC)` → `m->timer_fd`
+Коммит netfilter выполняется в **отдельном потоке** `nf_worker`. Главный поток пакетного пути только просит о записи. Причина — замеры на MT7621 (ARCH_AUDIT §12): холостой коммит (8 × `ip(6)tables -w -S`) занимает ~100 мс, до 300 мс; перестройка с RCI — ~280 мс; занятый xtables-lock добавляет к каждому вызову `iptables -w` не меньше 1 с (iptables 1.4.21 повторяет попытку раз в секунду); RCI ждёт до `RCI_TIMEOUT_SEC`. Пока коммит шёл в главном потоке, DNS, NFLOG и ответы DUMP conntrack ждали его. На железе это рвало соединения: удаление записи `ConntrackFlush` приходило через 90–140 мс, когда поток уже был на быстром пути.
 
-### Прочие функции
+`g_nf { thread, running, req_fd, timer_fd, stop_fd, heal_fd }`:
 
-- `signal_mgr_close(m)` — close обоих `fd`
-- `signal_mgr_arm_timer(m, milliseconds)` — one-shot через `timerfd_settime`
-- `signal_mgr_read_timer(m)` — `read()` expirations
+- `req_fd` — `eventfd` запроса записи: `SIGUSR1` и стартовый коммит делают `eventfd_write(req_fd, 1)`;
+- `timer_fd` — one-shot `timerfd` повтора, принадлежит потоку (`nf_arm_retry`, `NF_COMMIT_INTERVAL_MS`);
+- `stop_fd` — `eventfd` остановки;
+- `heal_fd` — `eventfd` из потока в главный цикл: «правила дописаны, нужно лечение conntrack».
 
-`arm_timer` вызывается только из `commit_start`/`commit_run`, то есть либо при
-неактивном цикле, либо сразу после `read_timer`. Обработчик сигнала таймер не
-трогает, поэтому взвести уже сработавший, но ещё не прочитанный таймер нельзя —
-блокирующий `read(timer_fd)` не может залипнуть.
+`nf_start()` создаёт дескрипторы и поток через `thread_start_masked` (все сигналы заблокированы: асинхронные сигналы остаются главному потоку и его `signalfd`; `SIGPIPE` демон игнорирует целиком, запись в закрытый канал или сокет даёт `EPIPE`). `nf_stop()` пишет в `stop_fd`, ждёт `pthread_join` и закрывает дескрипторы. Поток доделывает текущую запись, её длительность ограничена дедлайнами: `CHILD_DEADLINE_MS` на процесс, `RCI_TIMEOUT_SEC` на запрос RCI.
 
-### Логика обработки (`main.c`, epoll loop)
+**Владение без блокировок.** После `nf_start` только поток коммитера вызывает `perform_update` и всё, что за ним: `rci.c`, `routing.c` (`g_drm`), `iptables.c`, `g_policies_pending`. Главный поток владеет пакетным путём: `g_ipset_mgr`, `g_conntrack`, `tcp_reasm`, NFLOG. Общие данные (`g_config`, `g_all_sorted`, `g_policy_names`, `g_l7_active`/`g_l7_wan`, `g_conntrack.fd`) записываются только до `pthread_create` и после `pthread_join`. Лечение conntrack (`heal_match` → `ipset_test` на сокете `g_ipset_mgr`) поэтому идёт в главном потоке: `perform_update` при `restored` и активном conntrack пишет в `heal_fd`, главный цикл снимает `snapshot_local_addrs()` и вызывает `conntrack_heal_request()`. `log_write` — один `vfprintf`/`vsyslog` на строку, под блокировкой `FILE` в musl.
 
-Коммитер netfilter — leading-edge цикл на одном `timer_fd`. Требование NDMS
-(см. `NETFILTER_RACE.md`): накапливать вызовы `netfilter.d`, повторять при
-любой ошибке записи. Ключевое ограничение сверху — задержка первой записи:
-пока правил нет, а IP уже в ipset, новые соединения устанавливаются с маркой 0
-и уходят мимо целевой политики навсегда (conntrack держит их до закрытия).
-Поэтому первая запись выполняется без задержки.
+### Цикл коммитера
 
-Состояние цикла — один флаг `g_commit_active`.
+Leading-edge цикл на одном `timer_fd`. Требование NDMS (см. `NETFILTER_RACE.md`): накапливать вызовы `netfilter.d`, повторять при любой ошибке записи. Ключевое ограничение сверху — задержка первой записи: пока правил нет, а IP уже в ipset, новые соединения устанавливаются с маркой 0 и уходят мимо целевой политики навсегда (conntrack держит их до закрытия). Поэтому первая запись выполняется без задержки.
 
-**`SIGUSR1`:**
+Состояние цикла — локальный флаг `active` потока.
 
-- `g_commit_active != 0` → сигнал игнорируется целиком (`LOG_DEBUG "SIGUSR1
-  ignored, commit cycle active"`). Таймер **не** сбрасывается — это и есть
-  защита от дребезга: пачка из ~30 хуков одного события ndm не порождает ни
-  одной лишней записи и не сдвигает подтверждающую;
-- иначе → `commit_start()`: `g_commit_active=1`, немедленный `perform_update()`
-  (результат намеренно игнорируется — таблицу всё равно может затереть ndm
-  в середине своей пачки), таймер на `NF_COMMIT_INTERVAL_MS`.
+**Запрос (`req_fd`):**
 
-**`timer_fd`:** `signal_mgr_read_timer` → `commit_run()`:
+- `active != 0` → запрос игнорируется целиком (`LOG_DEBUG "commit request ignored, commit cycle active"`). Таймер **не** сбрасывается — это и есть защита от дребезга: пачка из ~30 хуков одного события ndm не порождает ни одной лишней записи и не сдвигает подтверждающую. Сигналы, пришедшие во время самой записи, копятся в счётчике `eventfd` и вычитываются одним `read` — тоже игнорируются;
+- иначе → `active=1`, немедленный `perform_update()` (результат намеренно игнорируется — таблицу всё равно может затереть ndm в середине своей пачки), таймер на `NF_COMMIT_INTERVAL_MS`.
 
-- `perform_update()` = `rci_auth_recover` + `rci_create_policies` (если
-  `g_policies_pending`); при `g_drm_active` — `drm_get_states` +
-  `drm_update_used_states` + `drm_handle_state_changes` + `drm_setup_all_routes`
-  (последний восстанавливает `ip rule`/`ip route` после NDMS: маршруты идемпотентны
-  через `ip route replace`, `ip rule` — по «File exists»); всегда — `apply_unified_connmark_rules(..., &g_config,
-  g_l7_active ? g_l7_wan : NULL)`
-- возврат `0` → `LOG_INFO "netfilter rules committed"`, `g_commit_active=0`,
-  цикл закончен; следующий SIGUSR1 запустит его заново
-- возврат `-1` → таймер снова на `NF_COMMIT_INTERVAL_MS`, без роста интервала.
-  Ретраи не заканчиваются: система самовосстанавливается без внешних событий
+**`timer_fd`:** `perform_update()`:
 
-Итого на одно событие ndm — минимум две записи: немедленная и подтверждающая
-через 3 с (она проходит уже после того, как пачка хуков отгремела). Вторая
-почти всегда бесплатна: дампы совпадают, `iptables-restore` не запускается.
+- `perform_update()` = `rci_auth_recover` + `rci_create_policies` (если `g_policies_pending`); при `g_drm_active` — `drm_get_states` + `drm_update_used_states` + `drm_handle_state_changes` + `drm_setup_all_routes` (последний восстанавливает `ip rule`/`ip route` после NDMS: маршруты идемпотентны через `ip route replace`, `ip rule` — по «File exists»); всегда — `apply_unified_connmark_rules(..., &g_config, g_l7_active ? g_l7_wan : NULL, &restored)`
+- возврат `0` → `LOG_INFO "netfilter rules committed"`, `active=0`, цикл закончен; следующий SIGUSR1 запустит его заново
+- возврат `-1` → таймер снова на `NF_COMMIT_INTERVAL_MS`, без роста интервала. Ретраи не заканчиваются: система самовосстанавливается без внешних событий
 
-Стартовый коммит (шаг 24 инициализации) идёт через тот же `commit_start()` —
-отдельного пути установки правил нет.
+Итого на одно событие ndm — минимум две записи: немедленная и подтверждающая через 3 с (она проходит уже после того, как пачка хуков отгремела). Вторая не пишет: дампы совпадают, `iptables-restore` не запускается.
 
-**`SIGINT`/`SIGTERM`:** `g_shutdown=1` → выход из epoll loop → cleanup.
+Стартовый коммит (шаг 24 инициализации) — такой же запрос в `req_fd`, отдельного пути установки правил нет.
+
+**`SIGINT`/`SIGTERM`:** `g_shutdown=1` → выход из epoll loop → cleanup (`nf_stop` до снятия правил).
 
 ---
 
@@ -859,7 +934,7 @@ geosite_domain_t { type uint32, value char* }
 - Формат: v2ray/xray protobuf, потоковое чтение (`setvbuf 64КБ`)
 - `read_varint()` / `read_varint_stream()` для streaming
 - `pb_next_field(data, len, &pos, &field)` — единый итератор protobuf-полей (varint / length-delimited, неизвестные wire-type → стоп); все парсеры построены на нём, дублирующейся skip-логики нет
-- `scan_dat_file(file, target_upper, visitor, ctx)` — generic stream-сканер (visitor-pattern: `count_geoip_visitor` / `extract_geoip_visitor` / `extract_geosite_visitor`)
+- `scan_dat_file(file, target_upper, visitor, ctx)` — generic stream-сканер (visitor-pattern: `count_geoip_visitor` / `extract_geoip_visitor` / `extract_geosite_visitor`): читает только префикс записи с кодом (`tag_equals_upper`, без копии и обрезки), несовпавшие записи пропускает `fseeko`, совпавшую — в переиспользуемый буфер; запись длиннее `DAT_ENTRY_MAX` (64 МБ) завершает разбор файла. Все длины из файла сравниваются в `uint64_t` с остатком (битый или недокачанный `.dat` не даёт ни переполнения кучи, ни вечного цикла — ARCH_AUDIT M5, `tests/check_geodat.c`)
 - `for_each_geoip_cidr(body, len, fn, ctx)` — обход CIDR-сообщений тега; подсчёт (`count_geoip_entry`) и извлечение (`append_geoip_entry`) — два callback'а одного обходчика
 - `extract_geoip_cidrs(file, country)` / `extract_geosite_domains(file, tag)` — полный скан до EOF
 - `parse_cidr_body()`, `parse_geosite_body()`, `parse_geosite_domain()` — тонкие switch'и по номеру protobuf-поля поверх `pb_next_field`
@@ -920,7 +995,7 @@ geosite_domain_t { type uint32, value char* }
 - Для каждого `geoip:TAG`: cumulative check `usage[v4_target].count + cached_ipv4 > effective_limit` → `LOG_WARN` + `allow_v4=0`; аналогично IPv6
 - GeoIP-записи и статические CIDR группируются в `batch_t` по `target_set` (`batch_find_or_add` через open-addressed FNV-1a индекс, `NAME_INDEX_SLOTS=256`)
 - Статические CIDR: `usage[target_set].count + 1 > effective_limit` → одно `LOG_WARN` (`warned` флаг), пропуск
-- Все батчи отправляются через `ipset_add_batch(with_timeout=0)` → постоянные записи
+- Все батчи отправляются через `ipset_add_batch(owner=IPSET_PERMANENT)` → постоянные записи
 
 `usage[]`/`batches[]` адресуются через общий open-addressed FNV-1a индекс `name_index_t` (`NAME_INDEX_SLOTS=256`): один `name_index_lookup` с callback-доступом к имени (`name_at_fn`) обслуживает оба массива — заменяет `O(n)` линейный скан при большом числе целей.
 
@@ -980,7 +1055,7 @@ geosite_domain_t { type uint32, value char* }
 
 Значение токена загружается через `rci_set_token()`; недопустимые символы (пробелы, управляющие, не-ASCII) обрезают его при загрузке — защита от инъекции в HTTP-заголовок, факт обрезки пишется в лог.
 
-Клиент не имеет состояния и heap-аллокаций: приёмный буфер — статический 32 КБ в `rci_request` (RCI вызывается только из главного потока), ответы точечных GET — десятки байт. Ранее держались два `malloc`-буфера по ~1 МБ на весь lifetime демона ради разового парсинга полного дерева политик.
+Клиент не имеет состояния и heap-аллокаций: приёмный буфер — статический 32 КБ в `rci_request` (после старта RCI вызывается только из потока коммитера), ответы точечных GET — десятки байт. Ранее держались два `malloc`-буфера по ~1 МБ на весь lifetime демона ради разового парсинга полного дерева политик.
 
 ### Сетевой клиент
 
@@ -1033,7 +1108,7 @@ GET /rci/show/ip/policy/NoSuch/mark      →  HTTP 404
 
 Полное дерево `/rci/show/ip/policy/` (JSON со всеми маршрутами всех политик, растёт с числом маршрутов без ограничений) не выкачивается и не парсится — ручной скобочный парсер и мегабайтные буферы удалены вместе с риском молчаливой поломки на обрезанном ответе.
 
-Без ретраев и без `sleep`; повтор — забота коммитера (`commit_run()` в `main.c`, фиксированные 3 с, без роста интервала).
+Без ретраев и без `sleep`; повтор — забота коммитера (поток `nf_worker` в `main.c`, фиксированные 3 с, без роста интервала).
 
 ### Создание политик
 
@@ -1057,9 +1132,9 @@ GET /rci/show/ip/policy/NoSuch/mark      →  HTTP 404
 #### `main.c` (порядок старта)
 
 - 14. `rci_create_policies(policy_names, policy_count)` — создание политик для всех целей-политик (интерфейсы DirectRoute сюда не попадают)
-- 24. `commit_start()` — первое применение правил
+- 24. Запрос в `g_nf.req_fd` — первое применение правил в потоке коммитера
 
-#### `iptables.c::apply_unified_connmark_rules` — вызывается только из `perform_update()` (`commit_start`/`commit_run`)
+#### `iptables.c::apply_unified_connmark_rules` — вызывается только из `perform_update()` (поток коммитера `nf_worker`)
 
 `rci_get_policy_mark` вызывается на стартовой сверке (`startup_audit`) для каждой цели-политики, дальше — только для целей без правил в дампе (раздел 8A, п. 3), без ретраев и `sleep`.
 Если марку получить не удалось (политика только что создана и роутер ещё не назначил `markID`, RCI недоступен,
@@ -1078,19 +1153,29 @@ GET /rci/show/ip/policy/NoSuch/mark      →  HTTP 404
 
 ## 14. Netlink Conntrack: `src/conntrack.c`
 
-`conntrack_mgr_t { fd, del_fd, pending[256], pending_count, dump_family, rescan, deleted }` — два long-lived `NETLINK_NETFILTER` сокета (init однократно в `main`, оба закрываются при выходе). `fd` — **неблокирующий** (`SOCK_NONBLOCK`, `SO_RCVBUF` 1МБ), несёт DUMP-поток и зарегистрирован в главном epoll; `del_fd` — DELETE-операции fire-and-forget (без `NLM_F_ACK`). DUMP выполняется асинхронно: главный event loop никогда не блокируется на сканировании таблицы conntrack — это устраняет проигрыш гонки «клиент открыл соединение раньше, чем ipset add» при burst-резолвах (загрузка страницы). Инициализатор в `main.c` — `{ .fd = -1, .del_fd = -1 }`.
+`conntrack_mgr_t { fd, del_fd, pending[256], pending_count, dump_family, dump_heal, heal_pending, rescan, deleted, heal_match }` — два long-lived `NETLINK_NETFILTER` сокета (init однократно в `main`, оба закрываются при выходе). `fd` — **неблокирующий** (`SOCK_NONBLOCK`, `SO_RCVBUF` 1МБ), несёт DUMP-поток и зарегистрирован в главном epoll; `del_fd` — DELETE-операции fire-and-forget (без `NLM_F_ACK`). DUMP выполняется асинхронно: главный event loop никогда не блокируется на сканировании таблицы conntrack — это устраняет проигрыш гонки «клиент открыл соединение раньше, чем ipset add» при burst-резолвах (загрузка страницы). Инициализатор в `main.c` — `{ .fd = -1, .del_fd = -1 }`.
 
 ### `conntrack_flush_request(m, new_ips, count)` — постановка в очередь
 
 1. Dedup-добавление IP в `pending[]` (по family+ip; переполнение `CT_PENDING_MAX=256` → `LOG_DEBUG`, IP пропускается)
 2. Если DUMP уже в полёте (`dump_family != 0`) — только `rescan = 1` (по завершении текущего DUMP будет один повторный проход, т.к. уже пройденные чанки не сверялись с добавленными IP)
-3. Иначе — `ct_dump_start()` для первого нужного семейства (IPv4 приоритетнее)
+3. Иначе — `ct_next_dump()`: DUMP для первого нужного семейства (IPv4 приоритетнее)
+
+### `conntrack_heal_request(m)` — самовосстановление после окна «правил нет»
+
+Вызывается из главного цикла по `g_nf.heal_fd`: поток коммитера пишет туда, когда `apply_unified_connmark_rules` вернул `restored=1` — CONNMARK-правила были дописаны вне стартового аудита (перестроена цепочка `HRNEO_CONNMARK` или возвращён переход из `PREROUTING`). Перед запросом главный цикл снимает список локальных адресов (`getifaddrs`, до `MAX_LOCAL_ADDRS=64`).
+
+1. `heal_pending = 1`; если DUMP не идёт — `ct_next_dump()`, иначе лечение стартует после текущего DUMP (два DUMP на одном netlink-сокете одновременно не идут)
+2. `ct_dump_start(m, family, heal=1)`: запрос `IPCTNL_MSG_CT_GET` + `NLM_F_DUMP` с атрибутами `CTA_MARK=0` и `CTA_MARK_MASK=0xffffffff` — ядро отдаёт только непромаркированные записи (фильтр в ядре 4.9-ndm точный, ARCH_AUDIT §8.1). IPv4, затем IPv6. Тот же фильтр несёт и DUMP flush (`heal=0`): запись с ненулевой connmark пересоздаётся с той же маркой (марку политики ndm сохраняет в connmark до перехода в `HRNEO_CONNMARK`, а правило hrneo ставит марку только при `connmark 0x0`), поэтому её удаление ничего не исправляет, а на быстром пути рвёт соединение (ARCH_AUDIT §12)
+3. Для каждой записи — `heal_match(family, dst)` (`main.c`): dst не локальный адрес И `ipset_test` находит его в множестве хотя бы одной цели (`IPSET_CMD_TEST`; для `hash:net` с маской хоста ядро проверяет все длины префикса) → `ct_delete_entry`
+
+Очерёдность (`ct_next_dump`): сначала flush по `pending[]`, затем лечение. Запрос flush во время лечения взводит `rescan` и выполняется после него; повторный запрос лечения во время лечения — ещё один проход.
 
 ### `conntrack_process(m)` — обработчик EPOLLIN на `m->fd`
 
-1. Цикл `recv(MSG_DONTWAIT)` до `EAGAIN`; `ENOBUFS` (переполнение rcvbuf) → `LOG_DEBUG` и продолжение
-2. Для каждой записи чанка: `ct_extract_orig_tuple()` → dst IP → сверка с `pending[]` текущего семейства → `ct_delete_entry(m->del_fd, ...)` при совпадении
-3. `NLMSG_DONE`/`NLMSG_ERROR` → `ct_dump_finished()`: переход IPv4→IPv6 (если есть pending IPv6), затем один rescan-проход (если флаг), иначе сброс состояния (`pending_count=0`, `dump_family=0`), счётчик удалений в `LOG_DEBUG`
+1. Не больше `CT_RECV_BUDGET`=8 вызовов `recv(MSG_DONTWAIT)` за пробуждение; ошибка или `EAGAIN` — выход. Пока DUMP идёт, ядро в каждом `recvmsg` дописывает следующий чанк, поэтому без бюджета дамп читался бы целиком за один вызов. Epoll уровневый: остаток будит цикл снова, DNS-события того же `epoll_wait` обрабатываются между порциями. `ENOBUFS` дамп не прерывает: в ядре 4.9 состояние дампа (`cb_running`) сохраняется, следующий `recvmsg` продолжает его (ARCH_AUDIT §13)
+2. Для каждой записи чанка: `ct_extract_orig_tuple()` → dst IP → сверка с `pending[]` текущего семейства (flush) или `heal_match` (лечение) → `ct_delete_entry(m->del_fd, ...)` при совпадении
+3. `NLMSG_DONE`/`NLMSG_ERROR` → `ct_dump_finished()`: лечение — переход IPv4→IPv6; flush — переход IPv4→IPv6 (если есть pending IPv6), без `rescan` — сброс `pending_count`; затем `ct_next_dump()` (повторный flush при `rescan`, иначе отложенное лечение, иначе простой). Счётчик удалений — `LOG_DEBUG`
 4. После каждого чанка — `ct_drain_del_fd()`: неблокирующий сброс сообщений об ошибках DELETE (`LOG_DEBUG`)
 
 ### `conntrack_delete_conn(m, conn)` — точечный DELETE для L7-канала
@@ -1137,7 +1222,7 @@ GET /rci/show/ip/policy/NoSuch/mark      →  HTTP 404
 
 ## 16. Система сборки: Makefile
 
-**Версия:** 3.21.0-1
+**Версия:** 3.24.0-1
 **Язык:** C (без CGO, без внешних библиотек)
 
 ### Кросс-компиляция
@@ -1162,6 +1247,21 @@ GET /rci/show/ip/policy/NoSuch/mark      →  HTTP 404
 **Линковка:** `-Wl,--gc-sections -s`; static: `-static -static-libgcc`. Макрос `VERSION` передаётся через `-DVERSION`.
 
 26 исходных файлов (`src/*.c`), заголовочные в `include/`. `pthread` — из libc (musl и glibc ≥ 2.34), отдельного `-lpthread` нет. Никаких `LIBS`/`LDFLAGS` для L7 — `NFLOG` через стандартный kernel-заголовок `<linux/netfilter/nfnetlink.h>` (формат сообщений `NFULNL_*` задан локально в `nflog_capture.c`). Криптография QUIC (`quic_crypto.c`) — pure-C целочисленная арифметика, MIPS soft-float safe.
+
+### Проверки: `make check` и `make fuzz`
+
+`make check` — 14 программ `tests/check_*.c`, детерминированные сценарии на хосте. Общие построители пакетов (TLS ClientHello, QUIC Initial с настоящей защитой через `quic_crypto.c`, IPv4/IPv6 UDP/TCP, DNS) — `tests/pkt.h`.
+
+`make fuzz` — мутационный фаззинг `tests/fuzz.c` поверх валидных затравок: TLS (`l7_dispatch_packet` + `tcp_reasm`, сегменты в произвольном порядке и с повторами), HTTP, QUIC (мутации открытого текста до защиты пакета и готовой датаграммы, CRYPTO-кадры вперемешку, несколько датаграмм, v1/v2), DNS (`extract_dns_payload` → `dns_parse_response` → `dns_result_repeat`), иногда — заголовки IP/TCP/UDP; IPv4 и IPv6. Каждый пакет передаётся в разбор копией в куче ровно своего размера, чтобы ASan видел любое чтение за концом. Инварианты: имя из L7 — 1–253 байт `[a-z0-9._-]`, у результата DNS число записей в пределах и строки завершены нулём. Перед мутациями — самопроверка: все валидные затравки обязаны распознаваться. Сборка и запуск:
+
+| Сборка | Итераций | Назначение |
+|---|---|---|
+| хост `gcc -fsanitize=address,undefined -fno-sanitize-recover=all` → `build/fuzz-asan` | `FUZZ_ITERS=200000` | выходы за границы, UB |
+| штатные тулчейны mipsel, mips, aarch64 → `build/fuzz-<arch>`, `qemu-<arch>-static` | `FUZZ_QEMU_ITERS=30000` | целевые платформы (32 бита, big-endian) |
+
+Детерминирован: итерация `i` целиком задаётся `(FUZZ_SEED, i)`, счётчики на всех архитектурах совпадают. Сбой печатает `fuzz: FAIL seed=S iter=I kind=K`, повтор одной итерации — `build/fuzz-asan 1 S I`. Сторожевой таймер (`alarm`, 20 с на 64 итерации) ловит зависания. Весь `make fuzz` — ~35 с; длинный прогон — `make fuzz FUZZ_ITERS=3000000`. Тулчейны должны быть в `PATH`, как для `make all`.
+
+`build/fuzz-asan emit <N> <seed> [clean]` пишет в stdout N случаев как готовые IPv4-пакеты (`u16` длина + пакет, контрольные суммы посчитаны) от клиента 192.168.2.210 к 198.51.100.20–219; в stderr — `case <i> <kind> <имя> <адрес>`. Отправка с тестового клиента — `tools/hwaudit/client/fuzzsend.py` (ARCH_AUDIT §17).
 
 ### Целевые платформы
 
@@ -1195,10 +1295,10 @@ GET /rci/show/ip/policy/NoSuch/mark      →  HTTP 404
 ```
 [Клиент LAN→WAN TCP 443/80]
     → iptables/ip6tables mangle/FORWARD + mangle/OUTPUT -o WAN -p tcp --dport 443|80
-      --tcp-flags SYN,ACK ACK -m connbytes 2:N -m length 60: -j NFLOG --nflog-group G
+      --tcp-flags SYN,ACK ACK -m connbytes 2:N -m length 41: -j NFLOG --nflog-group G
     → nflog_capture (raw NETLINK_NETFILTER, пассивная копия — без verdict)
     → l7_dispatch_packet (fail-fast IP/TCP/dport)
-    → probe_tls/probe_http (stateless парсеры) + tcp_reasm (фаза 2)
+    → stream_host: probe_tls/probe_http по непрерывному началу потока + tcp_reasm (фаза 2)
     → bogon_check → process_hostname_event_l7 → общий путь DNS-канала
       (match_domain_with_cname → ipset_add_batch; полный conntrack-DUMP НЕ вызывается — L7 передаёт allow_conntrack_flush=0)
     → при первом добавлении IP (и ConntrackFlush=true): conntrack_delete_conn(proto=TCP) → точечный DELETE по 5-tuple (реконнект через политику)
@@ -1208,19 +1308,20 @@ GET /rci/show/ip/policy/NoSuch/mark      →  HTTP 404
 ```
 [Клиент LAN→WAN UDP/443, пакет ≥ 1200 байт]
     → iptables/ip6tables mangle/FORWARD + mangle/OUTPUT -o WAN -p udp --dport 443
+      -m connbytes --connbytes 0:3 (датаграммы №1–4: в KeeneticOS connbytes = n − 1)
       -m length --length 1200: -j NFLOG --nflog-group G
     → nflog_capture → l7_dispatch_packet (fail-fast IP/UDP/dport)
-    → quic_extract_sni: Long Header detect → версия v1/v2 → Initial-тип
-      → DCID → HKDF-Extract(salt, DCID) → client_secret → key/iv/hp
+    → quic_walk_initial: Long Header detect → версия v1/v2 → Initial-тип
+      → DCID → HKDF-Extract(salt, DCID) → client_secret → key/iv/hp (метки v1 `quic *`, v2 `quicv2 *`)
       → header protection removal (AES-128-ECB(hp, sample)) → PN unmask
       → payload decrypt (AES-128-CTR, nonce=iv XOR pn, ctr_start=2)
       → frame walker: PADDING/PING skip, ACK/ACK_ECN full parse (ACK-frame skip)
-      → CRYPTO frame: offset==0 и CH целиком в пакете → fake TLS record → tls_extract_sni (fast-path);
-        иначе фрагмент (offset, data, len) отдаётся диспетчеру для реассамблеции
-    → [фрагментированный ClientHello, MLKEM/Kyber >1 датаграммы]
-      dispatch: build_quic_key (5-tuple, family|0x80 — отдельно от TCP) →
-      offset==0 → tcp_reasm_start (record_len = 4 + CH body len) / offset>0 → tcp_reasm_feed;
-      complete → quic_ch_to_sni(assembled) → tls_extract_sni. Общий пул с TCP-реассамблецией
+      → КАЖДЫЙ CRYPTO frame → asm_put в сборщик по интервалам (crypto_asm_t, статический буфер датаграммы):
+        порядок фреймов любой (Chrome Chaos Protection режет CH на 5+ фреймов вперемешку с PADDING/PING)
+    → dispatch: asm_handshake_total (4 + длина CH) → покрыт [0, total) → tls_handshake_sni (fast-path)
+    → [иначе: многодатаграммный CH (MLKEM/Kyber) или фрагменты в разных датаграммах]
+      build_quic_key (5-tuple, family|0x80 — отдельно от TCP) → tcp_reasm_acquire → asm_merge;
+      покрыт [0, total) → tls_handshake_sni → tcp_reasm_destroy. Общий пул с TCP-реассамблецией
       (`g_reasm`, GC-таймер 1с, TTL 5с); активна при `l7TcpReasmEnabled=true`
     → bogon_check → process_hostname_event_l7(tag="QUIC-SNI")
     → при первом добавлении IP (и ConntrackFlush=true): conntrack_delete_conn(proto=UDP) → точечный DELETE по 5-tuple UDP
@@ -1236,15 +1337,16 @@ NFQUEUE-десинхронизаторов (zapret2/nfqws2/tpws) — они ра
 
 ### 18.2 Модули
 
-- **`src/probe_tls.c`:** `tls_quick_check` (`d[0]=0x16, d[1]=0x03, d[2]<=0x03, d[5]=0x01`), `tls_extract_sni` (record→handshake→ext→SNI type 0, partial-OK, lowercase).
-- **`src/probe_http.c`:** case-insensitive `"\nHost:"`, порт обрезается, IPv6-литерал `[::1]` поддержан.
-- **`src/probe_quic.c`:** QUIC CRYPTO-walker для QUIC v1 (RFC 9001) и v2 (RFC 9369). Long Header detect: бит `0xC0`, версия `0x00000001`/`0x6b3343cf`. Initial-тип: `(pkt[0]&0x30)==0x00` (v1) или `==0x10` (v2). HKDF-цепочка: `initial_secret=HKDF-Extract(salt, DCID)` → `client_secret=HKDF-Expand-Label(is, "client in", 32)` → `key`(16B)/`iv`(12B)/`hp`(16B). Header protection: `mask=AES-128-ECB(hp, sample[pn_offset+4:+20])`, first_byte `&=0x0F` (Long Header), PN-байты XOR mask[1..pn_len]. Payload: AES-128-CTR `nonce=iv XOR pn_be` с `ctr_start=2` (GCM-конвенция). Frame walker: PADDING(0x00)/PING(0x01) skip; ACK(0x02)/ACK_ECN(0x03) — полный разбор через `read_varint` (largest_ack, delay, range_count, first_range, alt-ranges, ECN counts) вместо bail — **ключевое отличие от netwatch**; CRYPTO(0x06) — первый найденный фрейм отдаётся наружу через `quic_crypto_frag_t *frag` (`offset`, `data` в статическом `plain[]`, `len`); если `offset==0` и CH целиком в этом фрейме — `quic_ch_to_sni` fast-path (return 1). `quic_ch_to_sni(ch, ch_len, ...)` оборачивает CRYPTO-байты в fake TLS record `0x16 0x03 0x01 len[2]` (len = `ch_len`) → `tls_extract_sni`; используется и fast-path'ом, и после реассамблеции собранного ClientHello. Статические буферы: `plain[2048]`, `rec[QUIC_CH_REC_MAX=8192]` (собранный CH с MLKEM/Kyber крупнее одного датаграма). Реассамблеция многодатаграммного Initial живёт в `l7_dispatch.c` поверх общего `tcp_reasm` — см. ниже.
+- **`src/probe_tls.c`:** `tls_record_prefix` — данные могут быть началом записи ClientHello (`d[0]=0x16, d[1]=0x03, d[2]<=0x03, d[5]=0x01`, проверяются только имеющиеся байты), `tls_quick_check` = `len ≥ 11` + `tls_record_prefix`, `tls_handshake_sni` (handshake→ext→SNI type 0, partial-OK, без копии записи; прямой TCP-путь передаёт `payload+5`, QUIC — собранный CRYPTO-поток), `host_copy` — общая валидация имени для TLS/QUIC/HTTP: финальная точка снимается, длина 1…253, только `[a-z0-9._-]` (верхний регистр приводится), иначе имя **отвергается**, а не обрезается.
+- **`src/probe_http.c`:** `http_request_prefix` — данные могут быть началом запроса (метод из ≥ 2 заглавных букв и пробел в первых 9 байтах, проверяются только имеющиеся байты); `http_extract_host` — case-insensitive `"\nHost:"`, порт обрезается, строка обязана заканчиваться (`\r`, `\n`, пробел, `:`), иначе имя не принимается: разрез посреди имени не даёт обрезанного `chat` вместо `chatgpt.com`; имя проходит `host_copy` (IPv6-литерал `[::1]` отвергается — доменом не является); `http_headers_end` — найден `\r\n\r\n`.
+- **`src/probe_quic.c`:** `quic_walk_initial(pkt, len, crypto_asm_t *)` — QUIC CRYPTO-walker для QUIC v1 (RFC 9001) и v2 (RFC 9369). Long Header detect: бит `0xC0`, версия `0x00000001`/`0x6b3343cf`. Initial-тип: `(pkt[0]&0x30)==0x00` (v1) или `==0x10` (v2). HKDF-цепочка: `initial_secret=HKDF-Extract(salt, DCID)` → `client_secret=HKDF-Expand-Label(is, "client in", 32)` → `key`(16B)/`iv`(12B)/`hp`(16B) с метками `quic key/iv/hp` (v1) или `quicv2 key/iv/hp` (v2, RFC 9369 §3.3.2). Длины токена/payload/CRYPTO сравниваются в `uint64_t` с остатком (на 32-битных mips/mipsel `size_t` не сворачивается). Header protection: `mask=AES-128-ECB(hp, sample[pn_offset+4:+20])`, first_byte `&=0x0F` (Long Header), PN-байты XOR mask[1..pn_len]. Payload: AES-128-CTR `nonce=iv XOR pn_be` с `ctr_start=2` (GCM-конвенция). Frame walker: PADDING(0x00)/PING(0x01) skip; ACK(0x02)/ACK_ECN(0x03) — полный разбор через `read_varint` вместо bail — **ключевое отличие от netwatch**; **каждый** CRYPTO(0x06) кладётся в сборщик (`asm_put` по CRYPTO-offset). Возврат 1 — Initial расшифрован. Статический буфер: `plain[2048]`.
+- **`include/crypto_asm.h`:** сборщик потока по интервалам, общий для QUIC (CRYPTO-offset) и TCP (`seq - base_seq`): буфер + до `CRYPTO_ASM_RANGES=8` покрытых интервалов `[lo, hi)` (смежные и перекрывающиеся сливаются), `total` — ожидаемая длина (TCP: длина TLS-записи; QUIC: `asm_handshake_total` = 4 + длина CH из заголовка handshake). Готово, когда первый интервал покрывает `[0, total)`. Данные за `cap` отбрасываются; переполнение числа интервалов или `total > cap` — `broken` (запись уничтожается). Разрывы и перестановки сегментов/фреймов запись не убивают.
 - **`src/quic_crypto.c`:** SHA-256 (ctx: `state[8]`, `count`, `buf[64]`, `buf_len`; `sha256_compress` с полным schedule), HMAC-SHA256 (ipad/opad через два ctx-прохода), `hkdf_extract` = HMAC-SHA256(salt, IKM), `hkdf_expand_label` (HkdfLabel = `uint16(len)||uint8(6+label_len)||"tls13 "+label||0x00||0x01`). AES-128: 256-байтовый SBOX, 10-байтовый RCON, `aes_key_schedule` (44 слова, 11 round-keys), `aes_encrypt_block` (SubBytes+ShiftRows+MixColumns через `xtime`+AddRoundKey, column-major layout `s[row+4*col]`), `aes128_ecb_encrypt`, `aes128_ctr_xor` (single key schedule, big-endian counter bytes 12-15). Только целочисленные операции — MIPS soft-float safe.
 - **`src/bogon.c`:** служебные IPv4 (`0/8, 10/8, 127/8, 169.254/16, 172.16/12, 192.168/16, >=224`) и IPv6 (`ff00::/8, fc00::/7, fe80::/10, ::, ::1, ::ffff:0:0/96`).
-- **`src/nflog_capture.c`:** свой NFLOG-клиент без `libnetfilter_log` (subsys `NFLOG_SUBSYS=4` = `NFNL_SUBSYS_ULOG`, `PF_BIND`→`CFG_CMD_BIND`→`CFG_MODE` с `copy_range`+`NLBUFSIZ`, `recv MSG_DONTWAIT`, **без verdict** — поток односторонний). `nflog_capture_t { fd, group, seq, portid, callback, user_data, recv_buf[NFLOG_RECV_BUF_SIZE=128KB] }`. Парсинг атрибута `NFULA_PAYLOAD`. Защита от `ENOBUFS` (`LOG_WARN`, копии теряются — мягкая деградация, трафик клиента не страдает).
-- **`src/l7_firewall.c`:** `l7_firewall_resolve_wan` (config + `stat /sys/class/net`, иначе `/proc/net/route Destination==00000000`), `l7_firewall_load_kmod` / `l7_firewall_load_nflog_modules` (`nfnetlink_log`+`xt_NFLOG` через `init_module(2)`, нет `modprobe` на Keenetic), `l7_firewall_emit_rules` — дописывает недостающие правила в batch коммитера (`apply_unified_connmark_rules`); наличие определяется `dump_has_rule` по тому же дампу цепочек, без `iptables -C`; `l7_firewall_remove` при остановке — `iptables_delete_rules_matching` по `-o <WAN>` и `--nflog-group`. Правила TCP ставятся в обе цепочки `FORWARD`+`OUTPUT` × `iptables`/`ip6tables`. При `l7_enable_quic` — дополнительно UDP/443 с `--length 1200:` (длина ≥1200 байт — признак QUIC Initial, обязательно padded по RFC 9000). Для `dport 80` `connbytes_max` ужимается до `min(N, 4)`.
-- **`src/l7_dispatch.c`:** UDP-ветка (до TCP-проверки): `l4_proto==IPPROTO_UDP`, `dport==443`, `quic_extract_sni(..., &frag)`, `conn.proto=IPPROTO_UDP`. Если fast-path не вернул SNI, но `frag.found` и есть общий реассамблер (`g_reasm_ref`): `build_quic_key` (тот же 5-tuple `tcp_reasm_key_t`, но `family|=0x80` — QUIC-записи не коллидируют с TCP в общем пуле); `frag.offset==0` → `tcp_reasm_start` с `record_len = 4 + (CH body len из frag.data[1..3])`, иначе `tcp_reasm_lookup`+`tcp_reasm_feed(seq=offset)`; на `tcp_reasm_complete` — `tcp_reasm_get` → `quic_ch_to_sni` → `tcp_reasm_destroy`. Незавершённые сборки чистит общий GC (`tcp_reasm_gc`, TTL 5с). При `l7TcpReasmEnabled=false` реассамблеции QUIC нет — только одно-датаграммный fast-path (как и для длинных TLS ClientHello). TCP-ветка: `conn.proto=IPPROTO_TCP` + `try_tls_extract` (fast-path/reasm). `l7_dispatch_set_enable(tls, http, quic)`. `l7_conn_t` (`include/l7_dispatch.h`): поля `family`, `proto`, `client_ip[16]`, `server_ip[16]`, `client_port`, `server_port` — контекст нужен для точечного conntrack-DELETE по 5-tuple с корректным proto.
-- **`src/tcp_reasm.c`** (фаза 2): 5-tuple хеш (`TCP_REASM_BUCKETS=64`), пул `calloc-on-init` (`l7TcpReasmMaxEntries × TCP_REASM_BUF_SIZE=16KB`), `start/feed/complete/get/destroy/gc`, seq-упорядочивание (gap→drop, retransmit→no-op), LRU-eviction (`evict_lru` возвращает освобождённый слот — без повторного скана пула), `timerfd` GC (TTL `l7TcpReasmTtlSec`). Общий для двух источников: TCP-сегменты (`seq`) и QUIC CRYPTO-фрагменты (`seq`=CRYPTO offset, `record_len`=4+CH body len); QUIC-ключи помечены `family|0x80`, поэтому не коллидируют с TCP-записями в одном пуле. Оба потока байт — уже раскодированный prefix ClientHello, семантика хранилища для них одинакова.
+- **`src/nflog_capture.c`:** свой NFLOG-клиент без `libnetfilter_log` (subsys `NFLOG_SUBSYS=4` = `NFNL_SUBSYS_ULOG`, `PF_BIND`→`CFG_CMD_BIND`→`CFG_MODE` с `copy_range`, `NLBUFSIZ`=16 КБ, `QTHRESH`=8, `TIMEOUT`=2 cs (`NFLOG_QTHRESH`, `NFLOG_FLUSH_CS`: пачка до 8 пакетов, неполная — через 20 мс; умолчание ядра — 100 пакетов или 1 с, ARCH_AUDIT §15; буфер пачки 16 КБ = 8 × ~1,6 КБ, блок order-2 вместо order-5 у 128 КБ, которых в зоне Normal MT7621 нет; пакет больше буфера ядро шлёт отдельным skb своего размера), `recv MSG_DONTWAIT`, **без verdict** — поток односторонний). `nflog_capture_t { fd, group, seq, portid, callback, user_data, recv_buf[NFLOG_RECV_BUF_SIZE=128KB] }`. Парсинг атрибута `NFULA_PAYLOAD`. Защита от `ENOBUFS` (`LOG_WARN`, копии теряются — мягкая деградация, трафик клиента не страдает).
+- **`src/l7_firewall.c`:** правила TCP — `-m length --length 41:` (`TCP_LENGTH_TOKEN`): минимальный IPv4-пакет с 1 байтом нагрузки. Отсекаются только пустые ACK без TCP-опций; пустые ACK с timestamps (52 байта) проходят и отбрасываются в `l7_dispatch_packet` (на MT7621 +21 % копий TCP/443, ARCH_AUDIT §18). Прежний порог `60:` отсекал сегменты IPv4 с нагрузкой < 8 байт. `dump_has_rule` для TCP требует токен `--length 41:`. `l7_firewall_resolve_wan` (config + `stat /sys/class/net`, иначе `/proc/net/route Destination==00000000`), `l7_firewall_load_nflog_modules` (через общий `load_kmod` из `util.c`: `nfnetlink_log`+`xt_NFLOG` через `init_module(2)`, нет `modprobe` на Keenetic), `l7_firewall_emit_rules` — дописывает недостающие правила в batch коммитера (`apply_unified_connmark_rules`); наличие определяется `dump_has_rule` по тому же дампу цепочек, без `iptables -C`; `l7_firewall_remove` при остановке — `iptables_delete_rules_matching` по `-o <WAN>` и `--nflog-group`. Правила TCP ставятся в обе цепочки `FORWARD`+`OUTPUT` × `iptables`/`ip6tables`. При `l7_enable_quic` — дополнительно UDP/443 с `--length 1200:` (длина ≥1200 байт — признак QUIC Initial, обязательно padded по RFC 9000) и `--connbytes 0:3` (`QUIC_INITIAL_PACKETS_MAX`): HTTP/3-поток не копируется в userspace. `dump_has_rule` для UDP дополнительно требует токен `--connbytes 0:` — правило без окна не считается установленным. Для `dport 80` `connbytes_max` ужимается до `min(N, 4)`.
+- **`src/l7_dispatch.c`:** UDP-ветка (до TCP-проверки): `l4_proto==IPPROTO_UDP`, `dport==443`, `quic_sni`: `quic_walk_initial` в статический сборщик датаграммы (`TCP_REASM_BUF_SIZE`), `asm_handshake_total`, при полном покрытии — `tls_handshake_sni` без пула. Иначе, если есть общий реассамблер (`g_reasm_ref`): `build_quic_key` (тот же 5-tuple `tcp_reasm_key_t`, но `family|=0x80` — QUIC-записи не коллидируют с TCP в общем пуле) → `tcp_reasm_acquire` → `asm_merge` → при покрытии `[0, total)` — `tls_handshake_sni` → `tcp_reasm_destroy`. Незавершённые сборки чистит общий GC (`tcp_reasm_gc`, TTL 5с). При `l7TcpReasmEnabled=false` — только одно-датаграммный путь (как и для длинных TLS ClientHello). TCP-ветка — общая для TLS и HTTP `stream_host(parse, …)`: есть запись и `seq - base_seq < cap` → `asm_put` по смещению; запись вне окна уничтожается и пакет проверяется как начало нового потока. Без записи пакет сначала разбирается сам (`parse` → 1 имя найдено, 0 нужны ещё данные, −1 бросить); при 0 — `tcp_reasm_acquire(base_seq=seq)`. После каждого сегмента `parse` вызывается на непрерывном начале собранного потока `[0, r[0].hi)`; ответ ≠ 0 уничтожает запись. `tls_stream`: < 11 байт — `tls_record_prefix`; дальше `tls_quick_check`, длина записи ≤ 16 КБ, вся запись → `tls_handshake_sni(+5)`. `http_stream`: `http_request_prefix`, затем `http_extract_host`; конец заголовков без `Host` или 16 КБ — бросить. Начало потока — любой сегмент, который может быть началом записи/запроса, поэтому разрез клиентом на 1–2 байтах (средства обхода DPI) имя не теряет (ARCH_AUDIT §18). `l7_dispatch_set_enable(tls, http, quic)`. `l7_conn_t` (`include/l7_dispatch.h`): поля `family`, `proto`, `client_ip[16]`, `server_ip[16]`, `client_port`, `server_port` — контекст нужен для точечного conntrack-DELETE по 5-tuple с корректным proto.
+- **`src/tcp_reasm.c`** (фаза 2): 5-tuple хеш (`TCP_REASM_BUCKETS=64`), пул `calloc-on-init` (`l7TcpReasmMaxEntries × TCP_REASM_BUF_SIZE=16KB`), запись = ключ + `base_seq` + `crypto_asm_t` над своим буфером; API `find/acquire/destroy/gc` (`acquire` возвращает существующую запись или занимает слот), LRU-eviction (`evict_lru` возвращает освобождённый слот — без повторного скана пула), `timerfd` GC (TTL `l7TcpReasmTtlSec`). Общий для двух источников: TCP-сегменты (смещение `seq - base_seq`) и QUIC CRYPTO-фрагменты (смещение = CRYPTO offset); QUIC-ключи помечены `family|0x80`. Ограничение: сегмент, пришедший **раньше** первого сегмента записи TLS или HTTP-запроса, не опознаётся (нет начала потока) и не сохраняется.
 
 ### 18.3 Архитектурные решения
 
@@ -1258,7 +1360,7 @@ NFQUEUE-десинхронизаторов (zapret2/nfqws2/tpws) — они ра
 
 ### 18.4 Известные gaps (НЕ реализовано)
 
-- **QUIC v2 Initial type detection** — версия v2 определяется по `version==0x6b3343cf`; реализована. Многодатаграммный Initial (MLKEM/Kyber ClientHello, разбитый на 2+ Initial-пакета) реассамблируется по CRYPTO-offset — реализовано (§18.2, `l7_dispatch.c`). Не реализовано: Retry-пакеты (DCID меняется на Retry Token), несколько CRYPTO-фреймов внутри одного датаграма (берётся первый — на практике клиент кладёт по одному CRYPTO на Initial), QUIC over IPv6 Extension Headers с нестандартным next_header.
+- **QUIC v2 Initial type detection** — версия v2 определяется по `version==0x6b3343cf`; реализована. Многодатаграммный Initial (MLKEM/Kyber ClientHello, разбитый на 2+ Initial-пакета) реассамблируется по CRYPTO-offset — реализовано (§18.2, `l7_dispatch.c`). Несколько CRYPTO-фреймов в датаграмме в любом порядке (Chrome Chaos Protection) — реализовано (`crypto_asm.h`). Не реализовано: Retry-пакеты (DCID меняется на Retry Token), QUIC over IPv6 Extension Headers с нестандартным next_header.
 - **ECH (Encrypted ClientHello)** — нерешаемо без MITM
 - **iCloud Private Relay** — зашифрованный туннель, SNI релея (by design не наш)
 
@@ -1268,7 +1370,7 @@ NFQUEUE-десинхронизаторов (zapret2/nfqws2/tpws) — они ра
 
 > Бо́льшая часть сведений потеряна т.к. не документировалась.
 
-- **Event-driven архитектура.** Вся работа демона — один epoll-цикл: `cap.fd4` + `cap.fd6` + `signals.sig_fd` + `signals.timer_fd` + (опц.) `g_conntrack.fd` + `nflog_fd` + `reasm_gc_fd`. Единственный дополнительный поток — сокет watchlist API (раздел 20): он только читает таблицу доменов, неизменную после старта, поэтому синхронизации нет. Без GC, без каналов.
+- **Event-driven архитектура.** Пакетный путь — один epoll-цикл: `cap.fd4` + `cap.fd6` + `signals.sig_fd` + (опц.) `g_conntrack.fd` + `g_nf.heal_fd` + `nflog_fd` + `reasm_gc_fd`. Дополнительных потоков два: коммитер netfilter (раздел 9: `fork/exec` iptables, RCI, routing) и сокет watchlist API (раздел 20, только читает таблицу доменов, неизменную после старта). Состояние разделено по владению, синхронизации нет; связь — `eventfd`. Без GC.
 - **Netlink вместо `fork`/`exec` для ipset.** Все `CREATE`, `FLUSH`, `ADD` через прямой netlink-сокет (`NETLINK_NETFILTER`, long-lived).
 - **Батчевая отправка ipset через netlink.** `ipset_add_batch()`: чанки по 256 — send N сообщений, затем recv N ответов. Kernel обрабатывает очередь параллельно с чтением ответов.
 - **`iptables-restore` для batch-правил.** `apply_unified_connmark_rules()`: все `CONNMARK`-правила одним вызовом `iptables-restore --noflush`.
@@ -1277,7 +1379,7 @@ NFQUEUE-десинхронизаторов (zapret2/nfqws2/tpws) — они ра
 - **Кэш ipset-списков и единый timeout.** `set_names[]` (cache `ipset list -n` при старте) + одно поле `default_timeout` менеджера (timeout одинаков для всех сетов) — в `ipset_add_batch` нет ни хеширования имени, ни риска коллизий.
 - **Общий open-addressed FNV-1a индекс.** `name_index_t` в `geodat` для `batches[]` и `usage[]` (`NAME_INDEX_SLOTS=256`, доступ к имени через `name_at_fn`) — заменяет `O(n)` линейный поиск при большом числе целей.
 - **Коалесцирование SIGUSR1.** Один `timerfd` на leading-edge цикл: первый сигнал пишет таблицу немедленно, пока цикл активен — сигналы игнорируются целиком, без сброса таймера. Пачка из ~30 хуков одного `interface X down` даёт ровно две записи вместо тридцати.
-- **Асинхронный conntrack flush через netlink.** Два long-lived netlink-сокета (init однократно): неблокирующий `fd` для DUMP-потока (в epoll, чанки читаются между DNS-пакетами) + `del_fd` для DELETE fire-and-forget (без `NLM_F_ACK`). Новые IP коалесцируются в pending-буфер — один DUMP на burst вместо DUMP на каждый DNS-ответ, event loop не блокируется на сканировании таблицы. Без `fork`/`exec`.
+- **Асинхронный conntrack flush через netlink.** Два long-lived netlink-сокета (init однократно): неблокирующий `fd` для DUMP-потока (в epoll, фильтр ядра `CTA_MARK=0` — в userspace приходят только непромаркированные записи) + `del_fd` для DELETE fire-and-forget (без `NLM_F_ACK`). Новые IP коалесцируются в pending-буфер — один DUMP на burst вместо DUMP на каждый DNS-ответ, event loop не блокируется на сканировании таблицы. Без `fork`/`exec`.
 - **Стриминговый парсинг .dat-файлов.** Потоковое чтение через `setvbuf(64KB)`. В памяти хранятся только извлечённые записи. Visitor-pattern (`scan_dat_file`).
 - **Статическая аллокация в hot path.** `dns_result_t` (static в `process_dns_packet`), `processed[]`, `ipv4_batch[]`, `ipv6_batch[]`, `all_new[]` — на стеке, без `malloc`. CNAME-записи передаются в матчер как `dns_cname_t` напрямую из результата парсинга — промежуточного копирования на каждый DNS-ответ нет.
 - **Unified targets.** `g_all_sorted[]` объединяет политики и интерфейсы в единый отсортированный массив. `apply_unified_connmark_rules()` обрабатывает все цели одним проходом.
@@ -1285,7 +1387,7 @@ NFQUEUE-десинхронизаторов (zapret2/nfqws2/tpws) — они ра
 - **AF_PACKET SOCK_DGRAM + L3-BPF в ядре.** BPF-фильтры на сокетах через `SO_ATTACH_FILTER`. Ядро отбрасывает нерелевантные пакеты до копирования в userspace — только DNS-ответы достигают `process_dns_packet`. `SOCK_DGRAM` отдаёт пакет с IP-уровня единообразно для всех типов интерфейсов, поэтому фильтр работает по IP-версии/протоколу/порту без привязки к Ethernet-кадру.
 - **Контроль maxelem.** Единый проход подсчёта geoip-записей (счётный callback `for_each_geoip_cidr`, без аллокаций) с совмещённой детекцией oversized: тег с числом записей больше `IpsetMaxElem − CIDR_MIGRATE_HEADROOM (5000)` мигрирует в disabled-секцию `CIDRfile` (атомарно через `.tmp + rename`); при загрузке суммарный размер каждого ipset ограничивается `IpsetMaxElem` с переиспользованием тех же подсчётов.
 - **Table-driven config.** `PARAMS[]` (`src/params.c`) — одно описание параметра обслуживает `config_read`, `args_parse`/`args_apply`, `print_help`, `config_generate`.
-- **L7 fail-fast каскад.** Длина → IP-версия → протокол: UDP → dport 443 → QUIC-парсер; TCP → флаги → dport → 1-байтовая сигнатура TLS/HTTP → парсер. Реассамблеция запускается только для фрагментированных CH (fast-path для коротких). Один NFLOG-сокет.
+- **L7 fail-fast каскад.** Длина → IP-версия → протокол: UDP → dport 443 → QUIC-парсер; TCP → флаги → dport → префикс TLS-записи/HTTP-запроса → парсер. Реассамблеция запускается только для потоков, не уместившихся в пакет (fast-path для целых). Один NFLOG-сокет.
 
 ---
 
@@ -1305,7 +1407,7 @@ NFQUEUE-десинхронизаторов (zapret2/nfqws2/tpws) — они ра
 
 - Создаётся с полностью заблокированной маской сигналов (`pthread_sigmask` вокруг `pthread_create`): асинхронные сигналы остаются главному потоку и его `signalfd`.
 - Читает только `domain_hashtable_t`: после `build_geosite_domain_map` и `ht_rank_targets` таблица не меняется до `ht_destroy` (горячей перезагрузки нет, SIGUSR1 watchlist не перечитывает). Поэтому синхронизации нет, а указатели курсора `DUMP` остаются действительными. Если когда-нибудь появится перезагрузка watchlist, при ней нужно останавливать поток или обрывать выгрузки.
-- Не вызывает RCI, `iptables-restore`, ipset и логирование на запрос, поэтому коммит netfilter в главном потоке (блокирующий `fork/exec/waitpid` и RCI с таймаутом `RCI_TIMEOUT_SEC`) ответы не задерживает. Проверено: при RCI, который принимает соединение и молчит, главный цикл стоит на таймаутах, а `hrneo --match` отвечает за ~1,3 мс, почти всё из которых — запуск самого CLI-процесса.
+- Не вызывает RCI, `iptables-restore`, ipset и логирование на запрос, поэтому коммит netfilter (поток коммитера, раздел 9) ответы не задерживает. Проверено: при RCI, который принимает соединение и молчит, `hrneo --match` отвечает за ~1,3 мс, почти всё из которых — запуск самого CLI-процесса.
 
 ### Клиенты
 
@@ -1315,7 +1417,7 @@ NFQUEUE-десинхронизаторов (zapret2/nfqws2/tpws) — они ра
 - `EPOLLIN`: чтение до заполнения входного буфера или `EAGAIN`; `recv == 0` — полузакрытие (`eof`), ответы на уже полученные запросы отправляются.
 - Запросы разбираются, пока в выходном буфере есть ≥ 384 Б (`WLAPI_LINE_MAX`, хватает на самый длинный ответ `MATCH`). `MATCH` приводит имя к нижнему регистру в самом входном буфере и вызывает `watchlist_match`, без копий и аллокаций.
 - `DUMP`: на каждое событие записи выходной буфер дозаполняется строками `T` (по рангу), затем `K` (обход бакетов) и отправляется. Одна порция на событие — медленный читатель не задерживает `MATCH` других клиентов. Ключ, не помещающийся в пустой буфер, пропускается; `END n` считает только отправленные строки `K`.
-- Отправка только `send(..., MSG_NOSIGNAL)`: SIGPIPE в hrneo не обработан, `write` в закрытый клиентом сокет завершил бы процесс.
+- Отправка только `send(..., MSG_NOSIGNAL)`: запись в закрытый клиентом сокет даёт `EPIPE` без сигнала. Демон и так игнорирует `SIGPIPE` (`main()`), флаг оставлен, чтобы поток не зависел от глобальной диспозиции.
 - Маска `epoll` меняется только при смене набора событий: `EPOLLIN`, пока не `eof` и есть место во входном буфере; `EPOLLOUT`, пока есть неотправленные данные, идёт выгрузка или во входном буфере ждёт полная строка.
 - Закрытие: ошибка сокета, строка длиннее входного буфера, `eof` без незавершённой работы.
 
@@ -1327,7 +1429,7 @@ NFQUEUE-десинхронизаторов (zapret2/nfqws2/tpws) — они ра
 
 ## Резюме
 
-**HRNeo v3.21.0-1** — компактный policy routing демон для роутеров Keenetic, написанный на чистом C.
+**HRNeo v3.24.0-1** — компактный policy routing демон для роутеров Keenetic, написанный на чистом C.
 
 Два источника имён хостов:
 
@@ -1336,7 +1438,7 @@ NFQUEUE-десинхронизаторов (zapret2/nfqws2/tpws) — они ра
 
 Извлекает IP-адреса и добавляет в `ipset` через netlink, маркирует трафик в `iptables/mangle` для policy routing. Поддерживает маршрутизацию через политики Keenetic (mark через RCI API) и прямую на интерфейсы (`fwmark` + `ip rule` + `ip route`). GeoIP/GeoSite из `.dat` v2ray/xray с потоковым protobuf-парсингом.
 
-Event-driven архитектура на `epoll` (`cap.fd4` + `cap.fd6` + `signalfd` + `timerfd` + `g_conntrack.fd` + `nflog_fd` + `reasm_gc_fd`). Загруженный watchlist публикуется через Unix-сокет `/var/run/hrneo.sock` (`MATCH`/`DUMP`), который обслуживает отдельный поток, — для DNS-демонов и других программ (`docs/WATCHLIST_API.md`).
+Event-driven архитектура на `epoll` (`cap.fd4` + `cap.fd6` + `signalfd` + `g_conntrack.fd` + `nflog_fd` + `reasm_gc_fd`); коммит netfilter (iptables, RCI, routing) — в отдельном потоке и не задерживает пакетный путь. Загруженный watchlist публикуется через Unix-сокет `/var/run/hrneo.sock` (`MATCH`/`DUMP`), который обслуживает отдельный поток, — для DNS-демонов и других программ (`docs/WATCHLIST_API.md`).
 
 **30 параметров конфига**, все доступны через CLI-флаги (`--flag value`) + `--config <path>`, `--version`/`-v`, `--help`/`-h`, `--genconfig [path]`, `--keenetic <token>`, `--match <имя>`, `--dump`; приоритет: CLI > конфиг > дефолты. Описание параметров — единая таблица `PARAMS[]` в `src/params.c`, драйвит `config_read`, args, `--help`, `--genconfig`.
 

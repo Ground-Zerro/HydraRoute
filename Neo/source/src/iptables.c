@@ -6,9 +6,24 @@
 #include <stdio.h>
 #include <string.h>
 
+#define CONNMARK_CHAIN "HRNEO_CONNMARK"
+#define CONNMARK_RULE  "-A " CONNMARK_CHAIN " "
+#define CONNMARK_JUMP  "-j " CONNMARK_CHAIN
+#define XMARK_TAIL     "-m set --match-set %s dst -j CONNMARK --set-xmark 0x"
+#define RESTORE_RULE   "-m connmark --mark 0x%.*s -m conntrack --ctdir ORIGINAL -j CONNMARK --restore-mark --nfmask 0xffffffff --ctmask 0xffffffff"
+#define OVERRIDE_CHAIN "HRNEO_OVERRIDE"
+#define OVERRIDE_JUMP  "-m mark --mark 0xffffa00/0xfffff00 -m set --match-set %s dst -j " OVERRIDE_CHAIN
+
+static const char OVERRIDE_BODY[] =
+    ":" OVERRIDE_CHAIN " - [0:0]\n"
+    "-A " OVERRIDE_CHAIN " -p tcp -m tcp --dport 53 -j RETURN\n"
+    "-A " OVERRIDE_CHAIN " -p udp -m udp --dport 53 -j RETURN\n"
+    "-A " OVERRIDE_CHAIN " -m conntrack --ctstate NEW -j PPE\n"
+    "-A " OVERRIDE_CHAIN " -j CONNMARK --set-xmark 0x0/0xffffffff\n";
+
 typedef struct {
     char mark[16];
-    int  xmark, restore;
+    int  xmark, restore, override;
 } rule_state_t;
 
 typedef struct {
@@ -17,43 +32,41 @@ typedef struct {
     int  gone;
 } target_state_t;
 
-static const char *next_set_rule(const char **cursor, const char *pattern, size_t *len) {
+static const char *next_rule(const char **cursor, const char *pattern, size_t *len) {
     while (*cursor && **cursor) {
         const char *line = *cursor;
         const char *nl = strchr(line, '\n');
         *len = nl ? (size_t)(nl - line) : strlen(line);
         *cursor = nl ? nl + 1 : NULL;
-        if (line_find(line, *len, "-A PREROUTING ") == line && line_find(line, *len, pattern))
+        if (line_find(line, *len, CONNMARK_RULE) == line && line_find(line, *len, pattern))
             return line;
     }
     return NULL;
 }
 
 static void scan_rules(const char *dump, const char *set_name, rule_state_t *st) {
-    char pattern[128];
-    snprintf(pattern, sizeof(pattern), "--match-set %s dst ", set_name);
-    st->xmark = st->restore = 0;
-
+    char pattern[192];
     size_t len;
-    const char *cur = dump, *line;
-    while ((line = next_set_rule(&cur, pattern, &len))) {
-        if (line_find(line, len, "--restore-mark")) {
-            st->restore = 1;
-            continue;
-        }
-        const char *xmark = line_find(line, len, "--set-xmark ");
-        if (st->xmark || !xmark) continue;
-        xmark += 12;
-        if (xmark[0] == '0' && (xmark[1] == 'x' || xmark[1] == 'X'))
-            xmark += 2;
-        const char *slash = line_find(xmark, len - (size_t)(xmark - line), "/");
-        size_t mlen = slash ? (size_t)(slash - xmark) : 0;
-        if (mlen > 0 && mlen < sizeof(st->mark)) {
-            memcpy(st->mark, xmark, mlen);
-            st->mark[mlen] = '\0';
-            st->xmark = 1;
-        }
-    }
+    const char *cur = dump;
+    snprintf(pattern, sizeof(pattern), OVERRIDE_JUMP, set_name);
+    st->override = next_rule(&cur, pattern, &len) != NULL;
+
+    size_t plen = (size_t)snprintf(pattern, sizeof(pattern), XMARK_TAIL, set_name);
+    st->xmark = st->restore = 0;
+    cur = dump;
+    const char *line = next_rule(&cur, pattern, &len);
+    if (!line) return;
+    const char *mark = line_find(line, len, pattern) + plen;
+    const char *slash = line_find(mark, len - (size_t)(mark - line), "/");
+    size_t mlen = slash ? (size_t)(slash - mark) : 0;
+    if (mlen == 0 || mlen >= sizeof(st->mark)) return;
+    memcpy(st->mark, mark, mlen);
+    st->mark[mlen] = '\0';
+    st->xmark = 1;
+
+    snprintf(pattern, sizeof(pattern), RESTORE_RULE, (int)mlen, mark);
+    cur = dump;
+    st->restore = next_rule(&cur, pattern, &len) != NULL;
 }
 
 void iptables_delete_rules_matching(const char *ipt_cmd, const char *chain,
@@ -123,23 +136,35 @@ typedef struct {
     int  off;
     int  rule_count;
     int  rebuild;
+    int  lost;
+    int  chain_present;
+    int  jump_present;
 } connmark_family_t;
 
-static const char *const DUMP_CHAINS[] = {"PREROUTING", "FORWARD", "OUTPUT"};
+#define DUMP_CONNMARK 1
+static const char *const DUMP_CHAINS[] = {"PREROUTING", CONNMARK_CHAIN, "FORWARD", "OUTPUT"};
 
 static int dump_chains(connmark_family_t *fam, int chain_count) {
     size_t off = 0;
+    fam->chain_present = 0;
     for (int c = 0; c < chain_count; c++) {
         char *argv[] = {(char *)fam->ipt_cmd, "-w", "-t", "mangle", "-S",
                         (char *)DUMP_CHAINS[c], NULL};
-        if (run_command_output(fam->ipt_cmd, argv, fam->dump + off,
-                               sizeof(fam->dump) - off) != 0) {
+        int rc = run_command_output(fam->ipt_cmd, argv, fam->dump + off,
+                                    sizeof(fam->dump) - off);
+        if (rc != 0 && c == DUMP_CONNMARK) {
+            fam->dump[off] = '\0';
+            continue;
+        }
+        if (rc != 0) {
             LOG_WARN("%s -t mangle -S %s failed or output truncated",
                      fam->ipt_cmd, DUMP_CHAINS[c]);
             return -1;
         }
+        if (c == DUMP_CONNMARK) fam->chain_present = 1;
         off += strlen(fam->dump + off);
     }
+    fam->jump_present = strstr(fam->dump, CONNMARK_JUMP "\n") != NULL;
     return 0;
 }
 
@@ -153,21 +178,6 @@ static int batch_append(connmark_family_t *fam, const char *fmt, ...) {
         return -1;
     }
     fam->off += n;
-    return 0;
-}
-
-static int batch_delete_rules(connmark_family_t *fam, const char *set_name) {
-    char pattern[128];
-    snprintf(pattern, sizeof(pattern), "--match-set %s dst ", set_name);
-
-    int found = 0;
-    size_t len;
-    const char *cur = fam->dump, *line;
-    while ((line = next_set_rule(&cur, pattern, &len))) {
-        if (batch_append(fam, "-D%.*s\n", (int)len - 2, line + 2) != 0) return -1;
-        found = 1;
-    }
-    fam->rule_count += found;
     return 0;
 }
 
@@ -196,24 +206,32 @@ static int resolve_mark(const unified_target_t *t, int need_rci, target_state_t 
 }
 
 int apply_unified_connmark_rules(const unified_target_t *targets, int count,
-                                 const config_t *cfg, const char *l7_wan) {
+                                 const config_t *cfg, const char *l7_wan, int *restored) {
     static int startup_audit = 1;
     static connmark_family_t fams[2];
     static target_state_t states[MAX_TARGETS];
 
+    static int prefilter = -1;
     int incomplete = 0;
+    *restored = 0;
+
+    if (prefilter < 0) {
+        prefilter = load_kmod("xt_addrtype") == 0;
+        if (!prefilter)
+            LOG_WARN("xt_addrtype unavailable: CONNMARK rules run for packets addressed to the router too");
+    }
 
     fams[0].ipt_cmd = "iptables";  fams[0].restore_cmd = "iptables-restore";
     fams[1].ipt_cmd = "ip6tables"; fams[1].restore_cmd = "ip6tables-restore";
 
-    int chain_count = (l7_wan && l7_wan[0]) ? 3 : 1;
+    int chain_count = (l7_wan && l7_wan[0]) ? (int)(sizeof(DUMP_CHAINS) / sizeof(DUMP_CHAINS[0])) : DUMP_CONNMARK + 1;
 
     for (int fi = 0; fi < 2; fi++) {
         connmark_family_t *fam = &fams[fi];
         if (dump_chains(fam, chain_count) != 0) return -1;
         fam->off = 0;
         fam->rule_count = 0;
-        fam->rebuild = startup_audit;
+        fam->rebuild = fam->lost = startup_audit || !fam->chain_present;
         if (batch_append(fam, "*mangle\n") != 0) return -1;
     }
 
@@ -227,61 +245,81 @@ int apply_unified_connmark_rules(const unified_target_t *targets, int count,
         for (int fi = 0; fi < 2; fi++) {
             rule_state_t *st = &ts->fam[fi];
             scan_rules(fams[fi].dump, family_set(t, fi), st);
-            broken[fi] = !st->xmark || !st->restore;
+            broken[fi] = !st->xmark || !st->restore || (cfg->global_routing && !st->override);
             if (!st->xmark) need_rci = 1;
         }
         if (!startup_audit && !broken[0] && !broken[1]) continue;
         if (resolve_mark(t, need_rci, ts) != 0) incomplete = 1;
 
         for (int fi = 0; fi < 2; fi++) {
-            if (!broken[fi] || fams[fi].rebuild) continue;
+            if (fams[fi].rebuild || (!broken[fi] && !ts->gone)) continue;
             if (!ts->mark[0] && !ts->fam[fi].xmark) continue;
-            LOG_INFO("%s: rules for %s are missing, rebuilding all CONNMARK rules in PolicyOrder",
-                     fams[fi].ipt_cmd, family_set(t, fi));
+            if (!ts->gone)
+                LOG_INFO("%s: rules for %s are missing, rebuilding all CONNMARK rules in PolicyOrder",
+                         fams[fi].ipt_cmd, family_set(t, fi));
             fams[fi].rebuild = 1;
+            fams[fi].lost = !ts->gone;
         }
     }
 
     for (int fi = 0; fi < 2; fi++) {
         if (!fams[fi].rebuild) continue;
-        for (int i = 0; i < count; i++)
-            if (batch_delete_rules(&fams[fi], family_set(&targets[i], fi)) != 0) return -1;
+        if (batch_append(&fams[fi], ":" CONNMARK_CHAIN " - [0:0]\n") != 0) return -1;
+        if (cfg->global_routing && batch_append(&fams[fi], "%s", OVERRIDE_BODY) != 0) return -1;
+        fams[fi].rule_count++;
     }
 
-    const char *pkt_cond = cfg->global_routing ? "" : "-m mark ! --mark 0xffffaa0/0xffffff0 ";
+    const char *emit[MAX_TARGETS][2];
 
     for (int i = 0; i < count; i++) {
         const unified_target_t *t = &targets[i];
         const target_state_t *ts = &states[i];
 
         for (int fi = 0; fi < 2; fi++) {
-            connmark_family_t *fam = &fams[fi];
             const rule_state_t *st = &ts->fam[fi];
-            const char *set_name = family_set(t, fi);
-
+            emit[i][fi] = NULL;
             if (ts->gone) {
-                if (!st->xmark && !st->restore) continue;
-                LOG_INFO("Policy %s is gone, removing orphaned rules for %s",
-                         t->pair.ipv4, set_name);
-                if (!fam->rebuild && batch_delete_rules(fam, set_name) != 0) return -1;
+                if (st->xmark)
+                    LOG_INFO("Policy %s is gone, dropping orphaned rules for %s",
+                             t->pair.ipv4, family_set(t, fi));
                 continue;
             }
-            if (!fam->rebuild) continue;
-            const char *mark = ts->mark[0] ? ts->mark : st->xmark ? st->mark : NULL;
-            if (!mark) continue;
-            if (st->xmark && strcmp(st->mark, mark) != 0)
-                LOG_INFO("Mark changed for %s: %s -> %s", set_name, st->mark, mark);
+            if (!fams[fi].rebuild) continue;
+            emit[i][fi] = ts->mark[0] ? ts->mark : st->xmark ? st->mark : NULL;
+            if (emit[i][fi] && st->xmark && strcmp(st->mark, emit[i][fi]) != 0)
+                LOG_INFO("Mark changed for %s: %s -> %s", family_set(t, fi), st->mark, emit[i][fi]);
+        }
+    }
 
+    for (int i = 0; cfg->global_routing && i < count; i++)
+        for (int fi = 0; fi < 2; fi++)
+            if (emit[i][fi] && batch_append(&fams[fi], CONNMARK_RULE OVERRIDE_JUMP "\n",
+                                            family_set(&targets[i], fi)) != 0)
+                return -1;
+
+    for (int i = 0; i < count; i++) {
+        for (int fi = 0; fi < 2; fi++) {
+            connmark_family_t *fam = &fams[fi];
+            const char *mark = emit[i][fi];
+            if (!mark) continue;
+            const char *set_name = family_set(&targets[i], fi);
             if (batch_append(fam,
-                    "-A PREROUTING %s-m connmark --mark 0x0/0xffffffff -m set --match-set %s dst -j CONNMARK --set-xmark 0x%s/0xffffffff\n",
-                    pkt_cond, set_name, mark) != 0) return -1;
-            if (batch_append(fam,
-                    "-A PREROUTING -m set --match-set %s dst -j CONNMARK --restore-mark --nfmask 0xffffffff --ctmask 0xffffffff\n",
-                    set_name) != 0) return -1;
+                    CONNMARK_RULE "-m connmark --mark 0x0/0xffffffff " XMARK_TAIL "%s/0xffffffff\n",
+                    set_name, mark) != 0) return -1;
+            if (batch_append(fam, CONNMARK_RULE RESTORE_RULE "\n", (int)strlen(mark), mark) != 0)
+                return -1;
             fam->rule_count++;
             LOG_INFO("Adding rules for %s (mark: 0x%s) via %s",
                      set_name, mark, fam->restore_cmd);
         }
+    }
+
+    for (int fi = 0; fi < 2; fi++) {
+        connmark_family_t *fam = &fams[fi];
+        if (fam->jump_present) continue;
+        if (batch_append(fam, "-A PREROUTING %s" CONNMARK_JUMP "\n",
+                         prefilter ? "-m addrtype ! --dst-type LOCAL " : "") != 0) return -1;
+        fam->rule_count++;
     }
 
     if (l7_wan && l7_wan[0]) {
@@ -312,6 +350,7 @@ int apply_unified_connmark_rules(const unified_target_t *targets, int count,
             LOG_WARN("%s failed (exit %d)", fam->restore_cmd, ret);
             return -1;
         }
+        if (!startup_audit && (fam->lost || !fam->jump_present)) *restored = 1;
         LOG_DEBUG("Committed %d rule groups via %s", fam->rule_count, fam->restore_cmd);
     }
 
@@ -320,14 +359,37 @@ int apply_unified_connmark_rules(const unified_target_t *targets, int count,
     return 0;
 }
 
-int cleanup_connmark_rules(const ipset_pair_t *pairs, int count) {
-    for (int i = 0; i < count; i++) {
-        char needle[128];
-        snprintf(needle, sizeof(needle), "--match-set %s ", pairs[i].ipv4);
-        iptables_delete_rules_matching("iptables", "PREROUTING", needle, NULL);
-        snprintf(needle, sizeof(needle), "--match-set %s ", pairs[i].ipv6);
-        iptables_delete_rules_matching("ip6tables", "PREROUTING", needle, NULL);
+void cleanup_connmark_rules(int global_routing) {
+    static const char *const cmds[] = {"iptables", "ip6tables"};
+    static const char *const ops[] = {"-F", "-X"};
+    static const char *const chains[] = {CONNMARK_CHAIN, OVERRIDE_CHAIN};
+    int chain_count = global_routing ? 2 : 1;
+    for (int fi = 0; fi < 2; fi++) {
+        iptables_delete_rules_matching(cmds[fi], "PREROUTING", CONNMARK_JUMP, NULL);
+        for (int c = 0; c < chain_count; c++) {
+            for (int o = 0; o < 2; o++) {
+                char *argv[] = {(char *)cmds[fi], "-w", "-t", "mangle", (char *)ops[o],
+                                (char *)chains[c], NULL};
+                char discard[256];
+                if (run_command_output(cmds[fi], argv, discard, sizeof(discard)) != 0)
+                    LOG_WARN("%s -t mangle %s %s failed: %s", cmds[fi], ops[o], chains[c], discard);
+            }
+        }
     }
     LOG_INFO("CONNMARK rules cleaned up");
-    return 0;
+}
+
+int ppe_target_available(void) {
+    static const char *const files[] = {"/proc/net/ip_tables_targets", "/proc/net/ip6_tables_targets"};
+    for (int fi = 0; fi < 2; fi++) {
+        FILE *f = fopen(files[fi], "r");
+        if (!f) return 0;
+        char line[64];
+        int found = 0;
+        while (!found && fgets(line, sizeof(line), f))
+            found = strcmp(line, "PPE\n") == 0;
+        fclose(f);
+        if (!found) return 0;
+    }
+    return 1;
 }
