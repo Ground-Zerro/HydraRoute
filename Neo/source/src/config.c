@@ -15,7 +15,8 @@ int config_read(const char *path, config_t *cfg) {
     for (int i = 0; i < PARAMS_COUNT; i++) {
         const param_def_t *p = &PARAMS[i];
         if (p->default_int &&
-            (p->type == PT_BOOL || p->type == PT_INT || p->type == PT_INT_POS)) {
+            (p->type == PT_BOOL || p->type == PT_INT || p->type == PT_INT_POS ||
+             p->type == PT_INT_U16)) {
             *(int *)((char *)cfg + p->cfg_offset) = p->default_int;
         } else if (p->help_default &&
                    (p->type == PT_STRING || p->type == PT_PATH)) {
@@ -111,6 +112,7 @@ int config_generate(const char *target) {
             break;
         case PT_INT:
         case PT_INT_POS:
+        case PT_INT_U16:
             fprintf(f, "%s=%d\n", p->config_key, p->default_int);
             break;
         case PT_STRING:

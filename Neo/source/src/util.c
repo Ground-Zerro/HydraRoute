@@ -254,8 +254,9 @@ const char *line_find(const char *line, size_t line_len, const char *needle) {
     return NULL;
 }
 
-int run_command_stdin(const char *cmd, char *const argv[], const char *input, size_t input_len) {
-    return run_child(cmd, argv, input, input_len, NULL, 0);
+int run_command_stdin(const char *cmd, char *const argv[], const char *input, size_t input_len,
+                      char *output, size_t output_size) {
+    return run_child(cmd, argv, input, input_len, output, output_size);
 }
 
 static int module_already_loaded(const char *name) {

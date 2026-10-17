@@ -1,5 +1,5 @@
 PROJECT = hrneo
-VERSION = 3.24.0-1
+VERSION = 3.24.1-2
 
 CC_MIPSEL   = mipsel-linux-muslsf-gcc
 CC_MIPS     = mips-linux-muslsf-gcc
@@ -81,9 +81,9 @@ build/$(PROJECT)-aarch64: $(SRCS) Makefile
 
 check:
 	@mkdir -p build
-	$(CC_NATIVE) $(CFLAGS_NATIVE) tests/check_nf.c src/l7_firewall.c src/util.c src/log.c -o build/check_nf
+	$(CC_NATIVE) $(CFLAGS_NATIVE) -Wl,--wrap=run_command_output tests/check_nf.c src/l7_firewall.c src/util.c src/log.c -o build/check_nf
 	./build/check_nf
-	$(CC_NATIVE) $(CFLAGS_NATIVE) -Wl,--wrap=run_command_output,--wrap=run_command_stdin,--wrap=load_kmod tests/check_connmark.c src/iptables.c src/l7_firewall.c src/util.c src/log.c -o build/check_connmark
+	$(CC_NATIVE) $(CFLAGS_NATIVE) -Wl,--wrap=run_command_output,--wrap=run_command_stdin,--wrap=load_kmod tests/check_connmark.c src/iptables.c src/util.c src/log.c -o build/check_connmark
 	./build/check_connmark
 	$(CC_NATIVE) $(CFLAGS_NATIVE) tests/check_rci.c src/util.c src/log.c src/config.c src/params.c -o build/check_rci
 	./build/check_rci

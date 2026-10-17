@@ -10,6 +10,29 @@ void iptables_delete_rules_matching(const char *c, const char *ch,
     (void)c; (void)ch; (void)n1; (void)n2;
 }
 
+static const char *g_dump[2];
+static char g_batch[2][4096];
+static int g_restores, g_restore_rc;
+
+static int family_of(const char *cmd) {
+    return strncmp(cmd, "ip6", 3) == 0;
+}
+
+int __wrap_run_command_output(const char *cmd, char *const argv[], char *output, size_t size) {
+    assert(strcmp(argv[4], "-S") == 0 && strcmp(argv[5], "FORWARD") == 0);
+    snprintf(output, size, "%s", g_dump[family_of(cmd)]);
+    return 0;
+}
+
+int iptables_restore(const char *restore_cmd, const char *batch, size_t len) {
+    int fi = family_of(restore_cmd);
+    assert(len < sizeof(g_batch[fi]));
+    memcpy(g_batch[fi], batch, len);
+    g_batch[fi][len] = '\0';
+    g_restores++;
+    return g_restore_rc;
+}
+
 static void check_line_find(void) {
     const char *dump =
         "-A PREROUTING -m set --match-set hr_youtube dst -j CONNMARK --set-xmark 0xf00/0xffffffff\n"
@@ -42,11 +65,11 @@ static void check_emit_from_empty(void) {
 
     int lines = 0;
     for (int i = 0; i < n; i++) if (out[i] == '\n') lines++;
-    assert(lines == 6);
+    assert(lines == 3);
 
     assert(strstr(out, "-A FORWARD -o eth3 -p tcp --dport 443 "));
     assert(strstr(out, "-A FORWARD -o eth3 -p tcp --dport 80 "));
-    assert(strstr(out, "-A OUTPUT -o eth3 -p udp --dport 443 "));
+    assert(!strstr(out, "OUTPUT"));
     assert(strstr(out, "--connbytes 2:8 "));
     assert(strstr(out, "--connbytes 2:4 "));
     assert(strstr(out, "--nflog-group 210\n"));
@@ -57,15 +80,12 @@ static void check_emit_from_empty(void) {
 static void check_emit_quic_window(void) {
     config_t cfg = make_cfg();
     const char *unbounded =
-        "-A FORWARD -o eth3 -p udp -m udp --dport 443 -m length --length 1200:65535 -j NFLOG --nflog-group 210\n"
-        "-A OUTPUT -o eth3 -p udp -m udp --dport 443 -m connbytes --connbytes 0:3 "
-        "--connbytes-mode packets --connbytes-dir original -m length --length 1200:65535 -j NFLOG --nflog-group 210\n";
+        "-A FORWARD -o eth3 -p udp -m udp --dport 443 -m length --length 1200:65535 -j NFLOG --nflog-group 210\n";
     char out[4096];
     int n = l7_firewall_emit_rules(&cfg, "eth3", unbounded, out, sizeof(out));
     assert(n > 0);
     out[n] = '\0';
     assert(strstr(out, "-A FORWARD -o eth3 -p udp --dport 443 "));
-    assert(!strstr(out, "-A OUTPUT -o eth3 -p udp "));
 }
 
 static void check_emit_idempotent(void) {
@@ -93,9 +113,10 @@ static void check_emit_partial(void) {
 
     int lines = 0;
     for (int i = 0; i < n; i++) if (out[i] == '\n') lines++;
-    assert(lines == 5);
+    assert(lines == 2);
     assert(!strstr(out, "-A FORWARD -o eth3 -p tcp --dport 443 "));
-    assert(strstr(out, "-A OUTPUT -o eth3 -p tcp --dport 443 "));
+    assert(strstr(out, "-A FORWARD -o eth3 -p tcp --dport 80 "));
+    assert(strstr(out, "-A FORWARD -o eth3 -p udp --dport 443 "));
 }
 
 static void check_emit_old_length(void) {
@@ -144,17 +165,11 @@ static void check_emit_no_quic(void) {
     out[n] = '\0';
     int lines = 0;
     for (int i = 0; i < n; i++) if (out[i] == '\n') lines++;
-    assert(lines == 4);
+    assert(lines == 2);
     assert(!strstr(out, "-p udp"));
 }
 
-static void check_emit_concat_dump(void) {
-    config_t cfg = make_cfg();
-    const char *dump =
-        "-P PREROUTING ACCEPT\n"
-        "-A PREROUTING -j _NDM_HOTSPOT_PREROUTING_MANGL\n"
-        "-A PREROUTING -m set --match-set HydraRoute dst -j CONNMARK --restore-mark "
-        "--nfmask 0xffffffff --ctmask 0xffffffff\n"
+static const char CANONICAL_FORWARD[] =
         "-P FORWARD ACCEPT\n"
         "-A FORWARD -j NDMMARK --set-xndmmark 0x4/0x0\n"
         "-A FORWARD -o eth3 -p tcp -m tcp --dport 443 --tcp-flags SYN,ACK ACK "
@@ -165,22 +180,33 @@ static void check_emit_concat_dump(void) {
         "-m length --length 41:65535 -j NFLOG --nflog-group 210\n"
         "-A FORWARD -o eth3 -p udp -m udp --dport 443 -m connbytes --connbytes 0:3 "
         "--connbytes-mode packets --connbytes-dir original -m length --length 1200:65535 "
-        "-j NFLOG --nflog-group 210\n"
-        "-P OUTPUT ACCEPT\n"
-        "-A OUTPUT -j _NDM_OUTPUT_DELAY\n";
+        "-j NFLOG --nflog-group 210\n";
 
+static void check_emit_canonical_dump(void) {
+    config_t cfg = make_cfg();
     char out[4096];
-    int n = l7_firewall_emit_rules(&cfg, "eth3", dump, out, sizeof(out));
-    assert(n > 0);
-    out[n] = '\0';
+    assert(l7_firewall_emit_rules(&cfg, "eth3", CANONICAL_FORWARD, out, sizeof(out)) == 0);
+}
 
-    int lines = 0;
-    for (int i = 0; i < n; i++) if (out[i] == '\n') lines++;
-    assert(lines == 3);
-    assert(!strstr(out, "-A FORWARD "));
-    assert(strstr(out, "-A OUTPUT -o eth3 -p tcp --dport 443 "));
-    assert(strstr(out, "-A OUTPUT -o eth3 -p tcp --dport 80 "));
-    assert(strstr(out, "-A OUTPUT -o eth3 -p udp --dport 443 "));
+static void check_apply(void) {
+    config_t cfg = make_cfg();
+    g_dump[0] = "-P FORWARD ACCEPT\n";
+    g_dump[1] = CANONICAL_FORWARD;
+    g_restores = 0;
+    g_restore_rc = 0;
+    assert(l7_firewall_apply(&cfg, "eth3") == 0);
+    assert(g_restores == 1);
+    static const char head[] = "*mangle\n-A FORWARD -o eth3 -p tcp --dport 443 ";
+    assert(strncmp(g_batch[0], head, sizeof(head) - 1) == 0);
+    size_t len = strlen(g_batch[0]);
+    assert(len > 7 && strcmp(g_batch[0] + len - 7, "COMMIT\n") == 0);
+    assert(!strstr(g_batch[0], "OUTPUT"));
+
+    g_dump[1] = "-P FORWARD ACCEPT\n";
+    g_restores = 0;
+    g_restore_rc = -1;
+    assert(l7_firewall_apply(&cfg, "eth3") == -1);
+    assert(g_restores == 1);
 }
 
 static int count_tokens(const char *s) {
@@ -215,7 +241,8 @@ int main(void) {
     check_emit_no_wan();
     check_emit_no_quic();
     check_emit_quic_window();
-    check_emit_concat_dump();
+    check_emit_canonical_dump();
+    check_apply();
     printf("check_nf: all assertions passed\n");
     return 0;
 }

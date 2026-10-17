@@ -15,7 +15,8 @@ typedef struct {
 } unified_target_t;
 
 int apply_unified_connmark_rules(const unified_target_t *targets, int count,
-                                 const config_t *cfg, const char *l7_wan, int *restored);
+                                 const config_t *cfg, int *restored);
+int iptables_restore(const char *restore_cmd, const char *batch, size_t len);
 void cleanup_connmark_rules(int global_routing);
 int ppe_target_available(void);
 void iptables_delete_rules_matching(const char *ipt_cmd, const char *chain,

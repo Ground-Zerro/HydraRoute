@@ -5,9 +5,10 @@
 #include <stddef.h>
 
 int l7_firewall_resolve_wan(const config_t *cfg, char *out, size_t out_size);
-int l7_firewall_load_nflog_modules(void);
+int l7_firewall_load_modules(void);
 int l7_firewall_emit_rules(const config_t *cfg, const char *wan,
                            const char *dump, char *out, size_t out_size);
+int l7_firewall_apply(const config_t *cfg, const char *wan);
 int l7_firewall_remove(const config_t *cfg, const char *wan_iface);
 
 #endif

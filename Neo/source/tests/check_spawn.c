@@ -21,9 +21,10 @@ static int sh(const char *script, char *out, size_t out_size, long *ms) {
 
 static int sh_stdin(const char *script, const char *in, size_t in_len, long *ms) {
     char *argv[] = {"sh", "-c", (char *)script, NULL};
+    char out[64];
     struct timespec t0;
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    int rc = run_command_stdin("sh", argv, in, in_len);
+    int rc = run_command_stdin("sh", argv, in, in_len, out, sizeof(out));
     *ms = elapsed_ms(&t0);
     return rc;
 }
@@ -58,6 +59,10 @@ int main(void) {
     assert(sh_stdin("cat >/dev/null; exit 4", "", 0, &ms) == 4);
     assert(sh_stdin("sleep 5", big, sizeof(big), &ms) == -1);
     assert(ms >= CHILD_DEADLINE_MS - 1 && ms < CHILD_DEADLINE_MS + 1000);
+
+    char *cat_argv[] = {"sh", "-c", "cat; echo err >&2; exit 2", NULL};
+    assert(run_command_stdin("sh", cat_argv, "abc", 3, out, sizeof(out)) == 2);
+    assert(strcmp(out, "abcerr\n") == 0);
 
     puts("check_spawn: OK");
     return 0;

@@ -13,6 +13,7 @@ typedef enum {
     PT_BOOL,
     PT_INT,
     PT_INT_POS,         /* int, must be > 0 */
+    PT_INT_U16,
     PT_STRING,          /* fixed-size text buffer */
     PT_PATH,            /* STRING with buf_size = MAX_PATH_LEN */
     PT_REPEAT_PATH,     /* char[N][MAX_PATH_LEN] + count; --flag appends */

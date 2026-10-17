@@ -16,7 +16,8 @@ void to_lower_inplace(char *s, size_t len);
 char *trim_whitespace(char *s);
 int mkdir_p(const char *path, int mode);
 int run_command_output(const char *cmd, char *const argv[], char *output, size_t output_size);
-int run_command_stdin(const char *cmd, char *const argv[], const char *input, size_t input_len);
+int run_command_stdin(const char *cmd, char *const argv[], const char *input, size_t input_len,
+                      char *output, size_t output_size);
 int thread_start_masked(pthread_t *thread, void *(*fn)(void *));
 int load_kmod(const char *module_name);
 const char *line_find(const char *line, size_t line_len, const char *needle);

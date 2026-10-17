@@ -16,6 +16,7 @@ typedef struct {
     uint8_t  server_ip[16];
     uint16_t client_port;
     uint16_t server_port;
+    uint32_t mark;
 } l7_conn_t;
 
 void l7_dispatch_set_enable(int tls_enabled, int http_enabled, int quic_enabled);

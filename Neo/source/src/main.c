@@ -62,6 +62,7 @@ static struct {
     int timer_fd;
     int stop_fd;
     int heal_fd;
+    const char *l7_wan;
 } g_nf = { .req_fd = -1, .timer_fd = -1, .stop_fd = -1, .heal_fd = -1 };
 
 static int create_pid_file(const char *path) {
@@ -244,7 +245,7 @@ void process_hostname_event_l7(const char *host, int proto,
         new_count = process_hostname_event(host, NULL, 0, NULL, 0, &entry, 1, tag, 0);
     }
 
-    if (new_count > 0 && g_config.conntrack_flush)
+    if (new_count > 0 && g_config.conntrack_flush && conn->mark == 0)
         conntrack_delete_conn(&g_conntrack, conn);
 }
 
@@ -321,10 +322,14 @@ static int perform_update(void) {
         drm_handle_state_changes(&g_drm, (const char (*)[2][32])old_states, old_count);
         drm_setup_all_routes(&g_drm);
     }
-    int rc = apply_unified_connmark_rules(g_all_sorted, g_all_sorted_count, &g_config,
-                                          g_l7_active ? g_l7_wan : NULL, &restored);
+    int rc = apply_unified_connmark_rules(g_all_sorted, g_all_sorted_count, &g_config, &restored);
     if (restored && g_conntrack.fd >= 0)
         eventfd_write(g_nf.heal_fd, 1);
+    if (g_nf.l7_wan && l7_firewall_apply(&g_config, g_nf.l7_wan) != 0) {
+        LOG_ERROR("L7 NFLOG rules not written; L7 capture disabled until restart, DNS-only mode");
+        l7_firewall_remove(&g_config, g_nf.l7_wan);
+        g_nf.l7_wan = NULL;
+    }
     return rc;
 }
 
@@ -373,6 +378,7 @@ static int nf_start(void) {
     g_nf.timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC);
     if (g_nf.req_fd < 0 || g_nf.stop_fd < 0 || g_nf.heal_fd < 0 || g_nf.timer_fd < 0)
         return -1;
+    g_nf.l7_wan = g_l7_active ? g_l7_wan : NULL;
     if (thread_start_masked(&g_nf.thread, nf_worker) != 0) return -1;
     g_nf.running = 1;
     return 0;
@@ -659,11 +665,10 @@ int main(int argc, char *argv[]) {
     if (g_config.l7_capture_enabled) {
         if (l7_firewall_resolve_wan(&g_config, g_l7_wan, sizeof(g_l7_wan)) != 0) {
             LOG_WARN("L7 capture: WAN interface unknown; L7 disabled, DNS-only mode");
-        } else if (l7_firewall_load_nflog_modules() != 0) {
-            LOG_WARN("L7 capture: NFLOG kernel modules unavailable; L7 disabled, DNS-only mode");
+        } else if (l7_firewall_load_modules() != 0) {
+            LOG_WARN("L7 capture: kernel modules (nfnetlink_log, xt_NFLOG, xt_connbytes) unavailable; L7 disabled, DNS-only mode");
         } else {
             LOG_INFO("L7 WAN interface: %s", g_l7_wan);
-            load_kmod("xt_connbytes");
             l7_dispatch_set_enable(g_config.l7_enable_tls, g_config.l7_enable_http,
                                    g_config.l7_enable_quic);
 
@@ -683,7 +688,7 @@ int main(int argc, char *argv[]) {
                 LOG_INFO("TCP reassembly disabled (l7TcpReasmEnabled=false)");
             }
 
-            if (nflog_capture_init(&g_nflog, (uint16_t)g_config.l7_nflog_group,
+            if (nflog_capture_init(&g_nflog, g_config.l7_nflog_group,
                                    l7_dispatch_packet, NULL) == 0) {
                 g_l7_active = 1;
                 LOG_INFO("L7 capture enabled via NFLOG group #%d (TLS=%d HTTP=%d QUIC=%d)",

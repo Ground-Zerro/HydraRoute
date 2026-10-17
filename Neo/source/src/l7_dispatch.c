@@ -108,7 +108,7 @@ static int quic_sni(const uint8_t *quic, int quic_len, const tcp_reasm_key_t *ke
 void l7_dispatch_packet(const uint8_t *pkt, int len,
                         uint32_t mark, uint32_t ifin, uint32_t ifout,
                         void *user) {
-    (void)mark; (void)ifin; (void)ifout; (void)user;
+    (void)ifin; (void)ifout; (void)user;
 
     if (len < 28) return;
 
@@ -159,6 +159,7 @@ void l7_dispatch_packet(const uint8_t *pkt, int len,
         memset(&conn, 0, sizeof(conn));
         conn.family = (uint8_t)dst_family;
         conn.proto  = IPPROTO_UDP;
+        conn.mark   = mark;
         conn.client_port = sport;
         conn.server_port = dport;
         if (dst_family == AF_INET) {
@@ -196,6 +197,7 @@ void l7_dispatch_packet(const uint8_t *pkt, int len,
     memset(&conn, 0, sizeof(conn));
     conn.family = (uint8_t)dst_family;
     conn.proto  = IPPROTO_TCP;
+    conn.mark   = mark;
     conn.client_port = sport;
     conn.server_port = dport;
     if (dst_family == AF_INET) {

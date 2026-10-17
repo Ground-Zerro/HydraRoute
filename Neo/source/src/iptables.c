@@ -1,5 +1,4 @@
 #include "../include/iptables.h"
-#include "../include/l7_firewall.h"
 #include "../include/log.h"
 #include "../include/util.h"
 #include <stdarg.h>
@@ -142,12 +141,12 @@ typedef struct {
 } connmark_family_t;
 
 #define DUMP_CONNMARK 1
-static const char *const DUMP_CHAINS[] = {"PREROUTING", CONNMARK_CHAIN, "FORWARD", "OUTPUT"};
+static const char *const DUMP_CHAINS[] = {"PREROUTING", CONNMARK_CHAIN};
 
-static int dump_chains(connmark_family_t *fam, int chain_count) {
+static int dump_chains(connmark_family_t *fam) {
     size_t off = 0;
     fam->chain_present = 0;
-    for (int c = 0; c < chain_count; c++) {
+    for (int c = 0; c < (int)(sizeof(DUMP_CHAINS) / sizeof(DUMP_CHAINS[0])); c++) {
         char *argv[] = {(char *)fam->ipt_cmd, "-w", "-t", "mangle", "-S",
                         (char *)DUMP_CHAINS[c], NULL};
         int rc = run_command_output(fam->ipt_cmd, argv, fam->dump + off,
@@ -205,8 +204,23 @@ static int resolve_mark(const unified_target_t *t, int need_rci, target_state_t 
     return -1;
 }
 
+int iptables_restore(const char *restore_cmd, const char *batch, size_t len) {
+    char *argv[] = {(char *)restore_cmd, "--noflush", NULL};
+    char output[512];
+    int ret = run_command_stdin(restore_cmd, argv, batch, len, output, sizeof(output));
+    if (ret == 0) return 0;
+    char *w = output;
+    for (const char *r = output; *r; r++) {
+        if (*r != '\n') *w++ = *r;
+        else if (w > output && w[-1] != ' ' && r[1]) *w++ = ' ';
+    }
+    *w = '\0';
+    LOG_WARN("%s failed (exit %d): %s", restore_cmd, ret, output);
+    return -1;
+}
+
 int apply_unified_connmark_rules(const unified_target_t *targets, int count,
-                                 const config_t *cfg, const char *l7_wan, int *restored) {
+                                 const config_t *cfg, int *restored) {
     static int startup_audit = 1;
     static connmark_family_t fams[2];
     static target_state_t states[MAX_TARGETS];
@@ -224,11 +238,9 @@ int apply_unified_connmark_rules(const unified_target_t *targets, int count,
     fams[0].ipt_cmd = "iptables";  fams[0].restore_cmd = "iptables-restore";
     fams[1].ipt_cmd = "ip6tables"; fams[1].restore_cmd = "ip6tables-restore";
 
-    int chain_count = (l7_wan && l7_wan[0]) ? (int)(sizeof(DUMP_CHAINS) / sizeof(DUMP_CHAINS[0])) : DUMP_CONNMARK + 1;
-
     for (int fi = 0; fi < 2; fi++) {
         connmark_family_t *fam = &fams[fi];
-        if (dump_chains(fam, chain_count) != 0) return -1;
+        if (dump_chains(fam) != 0) return -1;
         fam->off = 0;
         fam->rule_count = 0;
         fam->rebuild = fam->lost = startup_audit || !fam->chain_present;
@@ -322,34 +334,11 @@ int apply_unified_connmark_rules(const unified_target_t *targets, int count,
         fam->rule_count++;
     }
 
-    if (l7_wan && l7_wan[0]) {
-        for (int fi = 0; fi < 2; fi++) {
-            connmark_family_t *fam = &fams[fi];
-            int n = l7_firewall_emit_rules(cfg, l7_wan, fam->dump,
-                                           fam->batch + fam->off,
-                                           sizeof(fam->batch) - fam->off);
-            if (n < 0) {
-                LOG_ERROR("%s batch overflow while emitting L7 rules", fam->restore_cmd);
-                return -1;
-            }
-            if (n > 0) {
-                fam->off += n;
-                fam->rule_count++;
-                LOG_INFO("Adding L7 NFLOG rules via %s (wan=%s)", fam->restore_cmd, l7_wan);
-            }
-        }
-    }
-
     for (int fi = 0; fi < 2; fi++) {
         connmark_family_t *fam = &fams[fi];
         if (fam->rule_count == 0) continue;
         if (batch_append(fam, "COMMIT\n") != 0) return -1;
-        char *argv[] = {(char *)fam->restore_cmd, "--noflush", NULL};
-        int ret = run_command_stdin(fam->restore_cmd, argv, fam->batch, fam->off);
-        if (ret != 0) {
-            LOG_WARN("%s failed (exit %d)", fam->restore_cmd, ret);
-            return -1;
-        }
+        if (iptables_restore(fam->restore_cmd, fam->batch, fam->off) != 0) return -1;
         if (!startup_audit && (fam->lost || !fam->jump_present)) *restored = 1;
         LOG_DEBUG("Committed %d rule groups via %s", fam->rule_count, fam->restore_cmd);
     }

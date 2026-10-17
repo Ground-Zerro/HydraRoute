@@ -8,6 +8,11 @@ if [ -f /opt/etc/init.d/rc.unslung ] &&
 then
     sed -i '/\[ $ACTION = stop -o $ACTION = restart -o $ACTION = kill \] && ORDER="-r"/a[ $ACTION = start ] && sleep 10' /opt/etc/init.d/rc.unslung
 fi
+mkdir -p /opt/etc/HydraRoute
+for f in hrneo.conf domain.conf ip.list; do
+    [ -e "/opt/etc/HydraRoute/$f" ] || : > "/opt/etc/HydraRoute/$f"
+    rm -f "/opt/etc/HydraRoute/$f-opkg" "/opt/etc/HydraRoute/$f-opkg.backup"
+done > /dev/null 2>&1
 /opt/etc/init.d/S99hrneo stop > /dev/null 2>&1
 /opt/etc/init.d/S99hrneo start || printf "${RED}[WARN]${RESET} Failed to start the HR Neo service\n"
 exit 0

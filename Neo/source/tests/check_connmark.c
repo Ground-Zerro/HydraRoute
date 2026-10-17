@@ -15,7 +15,7 @@
 static char table[2][MAX_LINES][256];
 static int  table_len[2];
 static int  chain_exists[2], ovr_exists[2];
-static int  restores, rci_calls, rci_absent, restored;
+static int  restores, rci_calls, rci_absent, restored, restore_fail;
 
 static int family_of(const char *cmd) {
     return strncmp(cmd, "ip6", 3) == 0;
@@ -77,6 +77,7 @@ int __wrap_run_command_output(const char *cmd, char *const argv[], char *output,
     const char *op = argv[4], *chain = argv[5];
     output[0] = '\0';
     if (strcmp(op, "-S") == 0) {
+        assert(strcmp(chain, "PREROUTING") == 0 || strcmp(chain, CHAIN) == 0);
         size_t off;
         if (strcmp(chain, CHAIN) == 0) {
             if (!chain_exists[fi]) {
@@ -123,9 +124,15 @@ int __wrap_run_command_output(const char *cmd, char *const argv[], char *output,
     return 1;
 }
 
-int __wrap_run_command_stdin(const char *cmd, char *const argv[], const char *input, size_t len) {
+int __wrap_run_command_stdin(const char *cmd, char *const argv[], const char *input, size_t len,
+                             char *output, size_t output_size) {
     int fi = family_of(cmd);
     restores++;
+    if (restore_fail) {
+        snprintf(output, output_size, "iptables-restore: Couldn't load match `connbytes'\n\nError occurred at line: 2\n");
+        return 2;
+    }
+    output[0] = '\0';
     char buf[IPT_BATCH_SIZE];
     memcpy(buf, input, len);
     buf[len] = '\0';
@@ -220,37 +227,37 @@ int main(void) {
 
     table_add(0, "-A PREROUTING -j _NDM_HOTSPOT_PREROUTING_MANGL");
 
-    assert(apply_unified_connmark_rules(t, 2, &cfg, NULL, &restored) == 0);
+    assert(apply_unified_connmark_rules(t, 2, &cfg, &restored) == 0);
     assert(restores == 2 && rci_calls == 2 && !restored);
     assert(chain_pos(0, "PREROUTING", JUMP) == 1);
     assert_policy_order();
 
     reset_counters();
-    assert(apply_unified_connmark_rules(t, 2, &cfg, NULL, &restored) == 0);
+    assert(apply_unified_connmark_rules(t, 2, &cfg, &restored) == 0);
     assert(restores == 0 && rci_calls == 0 && !restored);
     assert_policy_order();
 
     reset_counters();
     table_remove_matching(0, "--match-set RU dst ", NULL);
-    assert(apply_unified_connmark_rules(t, 2, &cfg, NULL, &restored) == 0);
+    assert(apply_unified_connmark_rules(t, 2, &cfg, &restored) == 0);
     assert(restores == 1 && rci_calls == 1 && restored);
     assert_policy_order();
 
     reset_counters();
     table_remove_matching(1, RESTORE("ff1"), NULL);
-    assert(apply_unified_connmark_rules(t, 2, &cfg, NULL, &restored) == 0);
+    assert(apply_unified_connmark_rules(t, 2, &cfg, &restored) == 0);
     assert(restores == 1 && rci_calls == 0);
     assert_policy_order();
 
     reset_counters();
     chain_drop(0);
-    assert(apply_unified_connmark_rules(t, 2, &cfg, NULL, &restored) == 0);
+    assert(apply_unified_connmark_rules(t, 2, &cfg, &restored) == 0);
     assert(restores == 1 && rci_calls == 2 && restored);
     assert_policy_order();
 
     reset_counters();
     table_remove_matching(1, "-j " CHAIN, NULL);
-    assert(apply_unified_connmark_rules(t, 2, &cfg, NULL, &restored) == 0);
+    assert(apply_unified_connmark_rules(t, 2, &cfg, &restored) == 0);
     assert(restores == 1 && rci_calls == 0 && restored);
     assert_policy_order();
 
@@ -259,14 +266,24 @@ int main(void) {
     table_remove_matching(0, "--match-set RU dst ", NULL);
     table_remove_matching(0, RESTORE("ff1"), NULL);
     for (int pass = 0; pass < 2; pass++)
-        assert(apply_unified_connmark_rules(t, 2, &cfg, NULL, &restored) == -1);
+        assert(apply_unified_connmark_rules(t, 2, &cfg, &restored) == -1);
     assert(restores == 1 && rci_calls == 2 && !restored);
     assert(chain_count(0, CHAIN) == 2 && chain_count(1, CHAIN) == 2);
 
     reset_counters();
     rci_absent = 0;
-    assert(apply_unified_connmark_rules(t, 2, &cfg, NULL, &restored) == 0);
+    assert(apply_unified_connmark_rules(t, 2, &cfg, &restored) == 0);
     assert(restores == 2 && rci_calls == 1);
+    assert_policy_order();
+
+    reset_counters();
+    restore_fail = 1;
+    chain_drop(0);
+    assert(apply_unified_connmark_rules(t, 2, &cfg, &restored) == -1);
+    assert(restores == 1 && !restored && !chain_exists[0]);
+    restore_fail = 0;
+    assert(apply_unified_connmark_rules(t, 2, &cfg, &restored) == 0);
+    assert(restored);
     assert_policy_order();
 
     cleanup_connmark_rules(0);
@@ -276,18 +293,18 @@ int main(void) {
 
     cfg.global_routing = 1;
     reset_counters();
-    assert(apply_unified_connmark_rules(t, 2, &cfg, NULL, &restored) == 0);
+    assert(apply_unified_connmark_rules(t, 2, &cfg, &restored) == 0);
     assert(restores == 2 && rci_calls == 2);
     assert_override_order();
 
     reset_counters();
-    assert(apply_unified_connmark_rules(t, 2, &cfg, NULL, &restored) == 0);
+    assert(apply_unified_connmark_rules(t, 2, &cfg, &restored) == 0);
     assert(restores == 0 && rci_calls == 0);
     assert_override_order();
 
     reset_counters();
     table_remove_matching(1, OVR_JUMP("HydraRoute6"), NULL);
-    assert(apply_unified_connmark_rules(t, 2, &cfg, NULL, &restored) == 0);
+    assert(apply_unified_connmark_rules(t, 2, &cfg, &restored) == 0);
     assert(restores == 1 && rci_calls == 0 && restored);
     assert_override_order();
 

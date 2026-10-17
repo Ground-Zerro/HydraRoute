@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <limits.h>
 
 #define BIT(n) ((uint32_t)1u << (n))
 
@@ -114,10 +115,10 @@ const param_def_t PARAMS[] = {
       BIT(18), 0,            0,
       "<true|false>",            "Enable L7 (TLS/HTTP) capture via NFLOG",     "false" },
 
-    { "l7NflogGroup",         "--l7NflogGroup",         PT_INT_POS,
+    { "l7NflogGroup",         "--l7NflogGroup",         PT_INT_U16,
       offsetof(config_t, l7_nflog_group),         0,
       BIT(19), 0,            210,
-      "<int>",                   "NFLOG group number for L7 capture",          "210"   },
+      "<1-65535>",                   "NFLOG group number for L7 capture",          "210"   },
 
     { "l7EnableTLS",          "--l7EnableTLS",          PT_BOOL,
       offsetof(config_t, l7_enable_tls),          0,
@@ -167,12 +168,11 @@ const param_def_t PARAMS[] = {
 
 const int PARAMS_COUNT = sizeof(PARAMS) / sizeof(PARAMS[0]);
 
-static int parse_int_value(const char *val, int *out, int must_be_positive) {
+static int parse_int_value(const char *val, int *out, long min, long max) {
     char *end;
     errno = 0;
     long v = strtol(val, &end, 10);
-    if (errno != 0 || *end != '\0' || end == val) return -1;
-    if (must_be_positive && v <= 0) return -1;
+    if (errno != 0 || *end != '\0' || end == val || v < min || v > max) return -1;
     *out = (int)v;
     return 0;
 }
@@ -188,10 +188,13 @@ int param_apply(config_t *cfg, const param_def_t *p, const char *val, int strict
         return -1;
 
     case PT_INT:
-        return parse_int_value(val, (int *)field, 0);
+        return parse_int_value(val, (int *)field, INT_MIN, INT_MAX);
 
     case PT_INT_POS:
-        return parse_int_value(val, (int *)field, 1);
+        return parse_int_value(val, (int *)field, 1, INT_MAX);
+
+    case PT_INT_U16:
+        return parse_int_value(val, (int *)field, 1, UINT16_MAX);
 
     case PT_STRING:
     case PT_PATH: {

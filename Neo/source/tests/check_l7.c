@@ -14,9 +14,10 @@
 static char g_host[256];
 static int g_proto;
 static int g_events;
+static uint32_t g_mark_in, g_mark;
 
 void process_hostname_event_l7(const char *host, int proto, const l7_conn_t *conn) {
-    (void)conn;
+    g_mark = conn->mark;
     snprintf(g_host, sizeof(g_host), "%s", host);
     g_proto = proto;
     g_events++;
@@ -75,12 +76,13 @@ static void send_quic(uint16_t sport, int v2, const uint8_t *ch, const frag_t *f
     size_t pl = quic_pad(plain, quic_crypto_frames(plain, ch, fr, nfr));
     size_t n = quic_protect(dgram, v2, plain, pl);
     size_t len = ip_udp(g_pkt, 0, SRC, DST, sport, 443, dgram, n);
-    l7_dispatch_packet(g_pkt, (int)len, 0, 0, 0, NULL);
+    l7_dispatch_packet(g_pkt, (int)len, g_mark_in, 0, 0, NULL);
 }
 
 static void expect(const char *host, int proto) {
     assert(g_events == 1);
     assert(g_proto == proto);
+    assert(g_mark == g_mark_in);
     assert(strcmp(g_host, host) == 0);
     reset_events();
 }
@@ -113,7 +115,7 @@ static void check_quic(void) {
 
 static void send_tcp(uint16_t dport, uint32_t seq, const uint8_t *data, size_t len) {
     size_t n = ip_tcp(g_pkt, 0, SRC, DST, 0xC001, dport, seq, 0x18, data, len);
-    l7_dispatch_packet(g_pkt, (int)n, 0, 0, 0, NULL);
+    l7_dispatch_packet(g_pkt, (int)n, g_mark_in, 0, 0, NULL);
 }
 
 static void check_tcp(void) {
@@ -220,7 +222,9 @@ int main(void) {
 
     check_varint_wrap();
     check_rfc_keys();
+    g_mark_in = 0xffffaab;
     check_quic();
+    g_mark_in = 0;
     check_tcp();
     check_short_first();
     check_names();

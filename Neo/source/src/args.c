@@ -136,6 +136,7 @@ void args_apply(const cli_args_t *args, config_t *cfg) {
         case PT_BOOL:
         case PT_INT:
         case PT_INT_POS:
+        case PT_INT_U16:
             *(int *)dst_field = *(const int *)src_field;
             break;
 
