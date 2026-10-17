@@ -1,5 +1,5 @@
 PROJECT = hrneo
-VERSION = 3.24.1-2
+VERSION = 3.24.2-1
 
 CC_MIPSEL   = mipsel-linux-muslsf-gcc
 CC_MIPS     = mips-linux-muslsf-gcc

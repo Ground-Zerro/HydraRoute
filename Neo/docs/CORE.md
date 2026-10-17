@@ -1,6 +1,6 @@
 # HRNeo — техническая документация кодовой базы
 
-Исходный код HRNeo (HydraRoute Neo) v3.24.1-2: архитектура, модули, потоки данных, оптимизации.
+Исходный код HRNeo (HydraRoute Neo) v3.24.2-1: архитектура, модули, потоки данных, оптимизации.
 
 ---
 
@@ -243,7 +243,7 @@ struct { pthread_t thread; int running, req_fd, timer_fd, stop_fd, heal_fd; } g_
 16. `add_cidr_to_ipsets()` — если `CIDR=true` и `cidr_file_path` задан
 17. `build_geosite_domain_map()` — если `gs_count > 0` (правила `geosite:` распарсены один раз на шаге 10 и переиспользуются)
 18. `drm_setup_all_routes()` — `ip rule` + `ip route` для DirectRoute
-19. Если `GlobalRouting=true` и `ppe_target_available()` не находит цель `PPE` в `/proc/net/ip{,6}_tables_targets` — `LOG_ERROR`, `global_routing = 0` (§8). Если `conntrack_flush` — `conntrack_mgr_init()` (при ошибке flush отключается)
+19. Если `GlobalRouting=true` и `ppe_target_available()` не находит цель `PPE` в `/proc/net/ip{,6}_tables_targets` — `LOG_ERROR`, `global_routing = 0` (§8). Затем `LOG_INFO "GlobalRouting enabled|disabled"` — итоговое состояние режима. Если `conntrack_flush` — `conntrack_mgr_init()` (при ошибке flush отключается)
 20. `pkt_capture_init()` — два `AF_PACKET SOCK_DGRAM/ETH_P_ALL` сокета (`fd4`, `fd6`)
 21. Если `l7_capture_enabled`: `l7_firewall_resolve_wan` (при неудаче — L7 отключается с `LOG_WARN`, DNS-only); `l7_firewall_load_modules` (`nfnetlink_log`+`xt_NFLOG`+`xt_connbytes` через `init_module(2)`; при неудаче — L7 отключается, DNS-only, **без fallback**). Иначе: `l7_dispatch_set_enable` (с флагами tls/http/quic); при `l7_tcp_reasm_enabled` — `tcp_reasm_init` + `l7_dispatch_set_reasm` (`g_reasm_active=1`); `nflog_capture_init` → `g_l7_active=1`. Правила NFLOG **не ставятся здесь** — их пишет коммитер отдельным batch после `CONNMARK` (`l7_firewall_apply`, шаг 24)
 22. `signal_mgr_init()` — `sigprocmask` + `signalfd`
@@ -1222,7 +1222,7 @@ GET /rci/show/ip/policy/NoSuch/mark      →  HTTP 404
 
 ## 16. Система сборки: Makefile
 
-**Версия:** 3.24.1-2
+**Версия:** 3.24.2-1
 **Язык:** C (без CGO, без внешних библиотек)
 
 ### Кросс-компиляция
@@ -1429,7 +1429,7 @@ NFQUEUE-десинхронизаторов (zapret2/nfqws2/tpws) — они ра
 
 ## Резюме
 
-**HRNeo v3.24.1-2** — компактный policy routing демон для роутеров Keenetic, написанный на чистом C.
+**HRNeo v3.24.2-1** — компактный policy routing демон для роутеров Keenetic, написанный на чистом C.
 
 Два источника имён хостов:
 

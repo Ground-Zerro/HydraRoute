@@ -647,6 +647,7 @@ int main(int argc, char *argv[]) {
                   "not found in this firmware, GlobalRouting disabled");
         g_config.global_routing = 0;
     }
+    LOG_INFO("GlobalRouting %s", g_config.global_routing ? "enabled" : "disabled");
 
     if (g_config.conntrack_flush) {
         g_conntrack.heal_match = heal_match;
